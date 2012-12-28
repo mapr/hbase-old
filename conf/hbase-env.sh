@@ -35,7 +35,7 @@
 # For more on why as well as other possible settings,
 # see http://wiki.apache.org/hadoop/PerformanceTuning
 # and http://www.scribd.com/doc/37127094/GCTuningPresentationFISL10
-export HBASE_OPTS="-XX:+UseConcMarkSweepGC -XX:+UseParNewGC -XX:NewRatio=16 -XX:CMSInitiatingOccupancyFraction=70 -XX:+UseCMSInitiatingOccupancyOnly -XX:MaxGCPauseMillis=100"
+export HBASE_OPTS="$HBASE_OPTS -XX:+UseConcMarkSweepGC -XX:+UseParNewGC -XX:NewRatio=16 -XX:CMSInitiatingOccupancyFraction=70 -XX:+UseCMSInitiatingOccupancyOnly -XX:MaxGCPauseMillis=100"
 
 # Uncomment below to enable java garbage collection logging
 # export HBASE_GC_OPTS="$HBASE_GC_OPTS -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps"
