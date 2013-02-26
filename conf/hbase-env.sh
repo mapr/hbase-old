@@ -54,6 +54,8 @@ export HBASE_OPTS="-XX:+UseConcMarkSweepGC"
 # This applies to both the server and client GC options above
 # export HBASE_USE_GC_LOGFILE=true
 
+# Dump heap on OOM
+export HBASE_OPTS="$HBASE_OPTS -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/opt/cores/"
 
 # Uncomment below if you intend to use the EXPERIMENTAL off heap cache.
 # export HBASE_OPTS="$HBASE_OPTS -XX:MaxDirectMemorySize="
@@ -104,3 +106,7 @@ export HBASE_OPTS="-XX:+UseConcMarkSweepGC"
 
 # Tell HBase whether it should manage it's own instance of Zookeeper or not.
 # export HBASE_MANAGES_ZK=true
+
+BASEMAPR=${MAPR_HOME:-/opt/mapr}
+env=${BASEMAPR}/conf/env.sh
+[ -f $env ] && . $env
