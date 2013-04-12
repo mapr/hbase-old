@@ -660,6 +660,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void addColumn(final String tableName, HColumnDescriptor column)
   throws IOException {
+    column.validate();
     getAdmin(tableName).addColumn(tableName, column);
   }
 
@@ -673,6 +674,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void addColumn(final byte [] tableName, HColumnDescriptor column)
   throws IOException {
+    column.validate();
     getAdmin(tableName).addColumn(tableName, column);
   }
 
@@ -711,7 +713,8 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void modifyColumn(final String tableName, HColumnDescriptor descriptor)
-  throws IOException {
+      throws IOException {
+    descriptor.validate();
     getAdmin(tableName).modifyColumn(tableName, descriptor);
   }
 
@@ -724,7 +727,8 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void modifyColumn(final byte [] tableName, HColumnDescriptor descriptor)
-  throws IOException {
+      throws IOException {
+    descriptor.validate();
     getAdmin(tableName).modifyColumn(tableName, descriptor);
   }
 
