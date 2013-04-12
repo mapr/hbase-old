@@ -23,24 +23,39 @@ import java.io.Closeable;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Collections;
 import java.util.NavigableMap;
+import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HServerAddress;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.client.HConnectionManager.HConnectable;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
+import org.apache.hadoop.hbase.ipc.ExecRPCInvoker;
+import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.Threads;
 
 /**
  * <p>Used to communicate with a single HBase table.
@@ -83,9 +98,24 @@ import org.apache.hadoop.hbase.util.Pair;
  * @see HConnection
  * @see HConnectionManager
  */
-public class HTable implements HTableInterface {
-  private static final HTableInterfaceFactoryEx tableFactory = new HTableFactoryEx();
-  private AbstractHTableInterface table = null;
+public class HTableHBase implements AbstractHTableInterface {
+  private static final Log LOG = LogFactory.getLog(HTable.class);
+  private HConnection connection;
+  private final byte [] tableName;
+  private volatile Configuration configuration;
+  private final ArrayList<Put> writeBuffer = new ArrayList<Put>();
+  private long writeBufferSize;
+  private boolean clearBufferOnFail;
+  private boolean autoFlush;
+  private long currentWriteBufferSize;
+  protected int scannerCaching;
+  private int maxKeyValueSize;
+  private ExecutorService pool;  // For Multi
+  private boolean closed;
+  private int operationTimeout;
+  private static final int DOPUT_WB_CHECK = 10;    // i.e., doPut checks the writebuffer every X Puts.
+  private final boolean cleanupPoolOnClose; // shutdown the pool in close()
+  private final boolean cleanupConnectionOnClose; // close the connection in close()
 
   /**
    * Creates an object to access a HBase table.
@@ -97,7 +127,7 @@ public class HTable implements HTableInterface {
    * @param tableName Name of the table.
    * @throws IOException if a remote or network exception occurs
    */
-  public HTable(Configuration conf, final String tableName)
+  public HTableHBase(Configuration conf, final String tableName)
   throws IOException {
     this(conf, Bytes.toBytes(tableName));
   }
@@ -113,13 +143,34 @@ public class HTable implements HTableInterface {
    * @param tableName Name of the table.
    * @throws IOException if a remote or network exception occurs
    */
-  public HTable(Configuration conf, final byte [] tableName)
+  public HTableHBase(Configuration conf, final byte [] tableName)
   throws IOException {
-    try {
-      table = tableFactory.createHTableInterface(conf, tableName);
-    } catch (Throwable e) {
-      GenericHFactory.handleIOException(e);
+    this.tableName = FSUtils.adjustTableName(tableName);
+    this.cleanupPoolOnClose = this.cleanupConnectionOnClose = true;
+    if (conf == null) {
+      this.connection = null;
+      return;
     }
+    this.connection = HConnectionManager.getConnection(conf);
+    this.configuration = conf;
+
+    int maxThreads = conf.getInt("hbase.htable.threads.max", Integer.MAX_VALUE);
+    if (maxThreads == 0) {
+      maxThreads = 1; // is there a better default?
+    }
+    long keepAliveTime = conf.getLong("hbase.htable.threads.keepalivetime", 60);
+
+    // Using the "direct handoff" approach, new threads will only be created
+    // if it is necessary and will grow unbounded. This could be bad but in HCM
+    // we only create as many Runnables as there are region servers. It means
+    // it also scales when new region servers are added.
+    this.pool = new ThreadPoolExecutor(1, maxThreads,
+        keepAliveTime, TimeUnit.SECONDS,
+        new SynchronousQueue<Runnable>(),
+        Threads.newDaemonThreadFactory("hbase-table"));
+    ((ThreadPoolExecutor)this.pool).allowCoreThreadTimeOut(true);
+
+    this.finishSetup();
   }
 
   /**
@@ -134,13 +185,16 @@ public class HTable implements HTableInterface {
    * @param pool ExecutorService to be used.
    * @throws IOException if a remote or network exception occurs
    */
-  public HTable(Configuration conf, final byte[] tableName, final ExecutorService pool)
+  public HTableHBase(Configuration conf, final byte[] tableName, final ExecutorService pool)
       throws IOException {
-    try {
-      table = tableFactory.createHTableInterface(conf, tableName, pool);
-    } catch (Throwable e) {
-      GenericHFactory.handleIOException(e);
-    }
+    this.connection = HConnectionManager.getConnection(conf);
+    this.configuration = conf;
+    this.pool = pool;
+    this.tableName = FSUtils.adjustTableName(tableName);
+    this.cleanupPoolOnClose = false;
+    this.cleanupConnectionOnClose = true;
+
+    this.finishSetup();
   }
 
   /**
@@ -154,13 +208,43 @@ public class HTable implements HTableInterface {
    * @param pool ExecutorService to be used.
    * @throws IOException if a remote or network exception occurs
    */
-  public HTable(final byte[] tableName, final HConnection connection,
+  public HTableHBase(final byte[] tableName, final HConnection connection,
       final ExecutorService pool) throws IOException {
-    try {
-      table = tableFactory.createHTableInterface(tableName, connection, pool);
-    } catch (Throwable e) {
-      GenericHFactory.handleIOException(e);
+    if (pool == null || pool.isShutdown()) {
+      throw new IllegalArgumentException("Pool is null or shut down.");
     }
+    if (connection == null || connection.isClosed()) {
+      throw new IllegalArgumentException("Connection is null or closed.");
+    }
+    this.tableName = FSUtils.adjustTableName(tableName);
+    this.cleanupPoolOnClose = this.cleanupConnectionOnClose = false;
+    this.connection = connection;
+    this.configuration = connection.getConfiguration();
+    this.pool = pool;
+
+    this.finishSetup();
+  }
+
+  /**
+   * setup this HTable's parameter based on the passed configuration
+   * @param conf
+   */
+  private void finishSetup() throws IOException {
+    this.connection.locateRegion(tableName, HConstants.EMPTY_START_ROW);
+    this.operationTimeout = HTableDescriptor.isMetaTable(tableName) ? HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT
+        : this.configuration.getInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,
+            HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT);
+    this.writeBufferSize = this.configuration.getLong(
+        "hbase.client.write.buffer", 2097152);
+    this.clearBufferOnFail = true;
+    this.autoFlush = true;
+    this.currentWriteBufferSize = 0;
+    this.scannerCaching = this.configuration.getInt(
+        "hbase.client.scanner.caching", 1);
+
+    this.maxKeyValueSize = this.configuration.getInt(
+        "hbase.client.keyvalue.maxsize", -1);
+    this.closed = false;
   }
 
   /**
@@ -168,7 +252,7 @@ public class HTable implements HTableInterface {
    */
   @Override
   public Configuration getConfiguration() {
-    return table.getConfiguration();
+    return configuration;
   }
 
   /**
@@ -182,7 +266,7 @@ public class HTable implements HTableInterface {
    */
   @Deprecated
   public static boolean isTableEnabled(String tableName) throws IOException {
-    return isTableEnabled(Bytes.toBytes(tableName));
+    return isTableEnabled(FSUtils.adjustTableName(tableName));
   }
 
   /**
@@ -196,7 +280,7 @@ public class HTable implements HTableInterface {
    */
   @Deprecated
   public static boolean isTableEnabled(byte[] tableName) throws IOException {
-    return isTableEnabled(HBaseConfiguration.create(), tableName);
+    return isTableEnabled(HBaseConfiguration.create(), FSUtils.adjustTableName(tableName));
   }
 
   /**
@@ -210,7 +294,7 @@ public class HTable implements HTableInterface {
   @Deprecated
   public static boolean isTableEnabled(Configuration conf, String tableName)
   throws IOException {
-    return isTableEnabled(conf, Bytes.toBytes(tableName));
+    return isTableEnabled(conf, FSUtils.adjustTableName(tableName));
   }
 
   /**
@@ -222,15 +306,12 @@ public class HTable implements HTableInterface {
    */
   public static boolean isTableEnabled(Configuration conf,
       final byte[] tableName) throws IOException {
-    Class<? extends AbstractHTableInterface> c =
-        HTableFactoryEx.get().getImplementingClass(conf, tableName);
-    try {
-      Method isTableEnabled = c.getDeclaredMethod("isTableEnabled",
-          new Class[] {Configuration.class, byte[].class });
-      return (Boolean) isTableEnabled.invoke(null, conf, tableName);
-    } catch (Exception e) {
-      throw (e instanceof IOException) ? (IOException)e : new IOException(e);
-    }
+    return HConnectionManager.execute(new HConnectable<Boolean>(conf) {
+      @Override
+      public Boolean connect(HConnection connection) throws IOException {
+        return connection.isTableEnabled(FSUtils.adjustTableName(tableName));
+      }
+    });
   }
 
   /**
@@ -241,7 +322,7 @@ public class HTable implements HTableInterface {
    */
   public HRegionLocation getRegionLocation(final String row)
   throws IOException {
-    return table.getRegionLocation(Bytes.toBytes(row));
+    return connection.getRegionLocation(tableName, Bytes.toBytes(row), false);
   }
 
   /**
@@ -253,7 +334,7 @@ public class HTable implements HTableInterface {
    */
   public HRegionLocation getRegionLocation(final byte [] row)
   throws IOException {
-    return table.getRegionLocation(row);
+    return connection.getRegionLocation(tableName, row, false);
   }
 
   /**
@@ -266,15 +347,15 @@ public class HTable implements HTableInterface {
    */
   public HRegionLocation getRegionLocation(final byte [] row, boolean reload)
   throws IOException {
-    return table.getRegionLocation(row, reload);
+    return connection.getRegionLocation(tableName, row, reload);
   }
-
+     
   /**
    * {@inheritDoc}
    */
   @Override
   public byte [] getTableName() {
-    return table.getTableName();
+    return this.tableName;
   }
 
   /**
@@ -285,7 +366,7 @@ public class HTable implements HTableInterface {
    */
   // TODO(tsuna): Remove this.  Unit tests shouldn't require public helpers.
   public HConnection getConnection() {
-    return table.getConnection();
+    return this.connection;
   }
 
   /**
@@ -295,7 +376,7 @@ public class HTable implements HTableInterface {
    * @deprecated Use {@link Scan#setCaching(int)} and {@link Scan#getCaching()}
    */
   public int getScannerCaching() {
-    return table.getScannerCaching();
+    return scannerCaching;
   }
 
   /**
@@ -310,7 +391,7 @@ public class HTable implements HTableInterface {
    * @deprecated Use {@link Scan#setCaching(int)}
    */
   public void setScannerCaching(int scannerCaching) {
-    table.setScannerCaching(scannerCaching);
+    this.scannerCaching = scannerCaching;
   }
 
   /**
@@ -318,7 +399,8 @@ public class HTable implements HTableInterface {
    */
   @Override
   public HTableDescriptor getTableDescriptor() throws IOException {
-    return table.getTableDescriptor();
+    return new UnmodifyableHTableDescriptor(
+      this.connection.getHTableDescriptor(this.tableName));
   }
 
   /**
@@ -329,7 +411,7 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public byte [][] getStartKeys() throws IOException {
-    return table.getStartKeys();
+    return getStartEndKeys().getFirst();
   }
 
   /**
@@ -340,7 +422,7 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public byte[][] getEndKeys() throws IOException {
-    return table.getEndKeys();
+    return getStartEndKeys().getSecond();
   }
 
   /**
@@ -352,7 +434,18 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public Pair<byte[][],byte[][]> getStartEndKeys() throws IOException {
-    return table.getStartEndKeys();
+    NavigableMap<HRegionInfo, ServerName> regions = getRegionLocations();
+    final List<byte[]> startKeyList = new ArrayList<byte[]>(regions.size());
+    final List<byte[]> endKeyList = new ArrayList<byte[]>(regions.size());
+
+    for (HRegionInfo region : regions.keySet()) {
+      startKeyList.add(region.getStartKey());
+      endKeyList.add(region.getEndKey());
+    }
+
+    return new Pair<byte [][], byte [][]>(
+      startKeyList.toArray(new byte[startKeyList.size()][]),
+      endKeyList.toArray(new byte[endKeyList.size()][]));
   }
 
   /**
@@ -362,7 +455,22 @@ public class HTable implements HTableInterface {
    * @deprecated Use {@link #getRegionLocations()} or {@link #getStartEndKeys()}
    */
   public Map<HRegionInfo, HServerAddress> getRegionsInfo() throws IOException {
-    return table.getRegionsInfo();
+    final Map<HRegionInfo, HServerAddress> regionMap =
+      new TreeMap<HRegionInfo, HServerAddress>();
+
+    final Map<HRegionInfo, ServerName> regionLocations = getRegionLocations();
+
+    for (Map.Entry<HRegionInfo, ServerName> entry : regionLocations.entrySet()) {
+      HServerAddress server = new HServerAddress();
+      ServerName serverName = entry.getValue();
+      if (serverName != null && serverName.getHostAndPort() != null) {
+        server = new HServerAddress(Addressing.createInetSocketAddressFromHostAndPortStr(
+            serverName.getHostAndPort()));
+      }
+      regionMap.put(entry.getKey(), server);
+    }
+
+    return regionMap;
   }
 
   /**
@@ -373,7 +481,7 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public NavigableMap<HRegionInfo, ServerName> getRegionLocations() throws IOException {
-    return table.getRegionLocations();
+    return MetaScanner.allTableRegions(getConfiguration(), getTableName(), false);
   }
 
   /**
@@ -386,8 +494,23 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public List<HRegionLocation> getRegionsInRange(final byte [] startKey,
-      final byte [] endKey) throws IOException {
-    return table.getRegionsInRange(startKey, endKey);
+    final byte [] endKey) throws IOException {
+    final boolean endKeyIsEndOfTable = Bytes.equals(endKey,
+                                                    HConstants.EMPTY_END_ROW);
+    if ((Bytes.compareTo(startKey, endKey) > 0) && !endKeyIsEndOfTable) {
+      throw new IllegalArgumentException(
+        "Invalid range: " + Bytes.toStringBinary(startKey) +
+        " > " + Bytes.toStringBinary(endKey));
+    }
+    final List<HRegionLocation> regionList = new ArrayList<HRegionLocation>();
+    byte [] currentKey = startKey;
+    do {
+      HRegionLocation regionLocation = getRegionLocation(currentKey, false);
+      regionList.add(regionLocation);
+      currentKey = regionLocation.getRegionInfo().getEndKey();
+    } while (!Bytes.equals(currentKey, HConstants.EMPTY_END_ROW) &&
+             (endKeyIsEndOfTable || Bytes.compareTo(currentKey, endKey) < 0));
+    return regionList;
   }
 
   /**
@@ -413,7 +536,7 @@ public class HTable implements HTableInterface {
    * to region cache.
    */
   public void prewarmRegionCache(Map<HRegionInfo, HServerAddress> regionMap) {
-    table.prewarmRegionCache(regionMap);
+    this.connection.prewarmRegionCache(this.getTableName(), regionMap);
   }
 
   /**
@@ -437,7 +560,13 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs
    */
   public void serializeRegionInfo(DataOutput out) throws IOException {
-    table.serializeRegionInfo(out);
+    Map<HRegionInfo, HServerAddress> allRegions = this.getRegionsInfo();
+    // first, write number of regions
+    out.writeInt(allRegions.size());
+    for (Map.Entry<HRegionInfo, HServerAddress> es : allRegions.entrySet()) {
+      es.getKey().write(out);
+      es.getValue().write(out);
+    }
   }
 
   /**
@@ -458,7 +587,19 @@ public class HTable implements HTableInterface {
    */
   public Map<HRegionInfo, HServerAddress> deserializeRegionInfo(DataInput in)
   throws IOException {
-    return table.deserializeRegionInfo(in);
+    final Map<HRegionInfo, HServerAddress> allRegions =
+      new TreeMap<HRegionInfo, HServerAddress>();
+
+    // the first integer is expected to be the size of records
+    int regionsCount = in.readInt();
+    for (int i = 0; i < regionsCount; ++i) {
+      HRegionInfo hri = new HRegionInfo();
+      hri.readFields(in);
+      HServerAddress hsa = new HServerAddress();
+      hsa.readFields(in);
+      allRegions.put(hri, hsa);
+    }
+    return allRegions;
   }
 
   /**
@@ -467,7 +608,12 @@ public class HTable implements HTableInterface {
    @Override
    public Result getRowOrBefore(final byte[] row, final byte[] family)
    throws IOException {
-     return table.getRowOrBefore(row, family);
+     return new ServerCallable<Result>(connection, tableName, row, operationTimeout) {
+       public Result call() throws IOException {
+         return server.getClosestRowBefore(location.getRegionInfo().getRegionName(),
+           row, family);
+       }
+     }.withRetries();
    }
 
    /**
@@ -475,7 +621,11 @@ public class HTable implements HTableInterface {
     */
   @Override
   public ResultScanner getScanner(final Scan scan) throws IOException {
-    return table.getScanner(scan);
+    if (scan.getCaching() <= 0) {
+      scan.setCaching(getScannerCaching());
+    }
+    return new ClientScanner(getConfiguration(), scan, getTableName(),
+        this.connection);
   }
 
   /**
@@ -483,7 +633,9 @@ public class HTable implements HTableInterface {
    */
   @Override
   public ResultScanner getScanner(byte [] family) throws IOException {
-    return table.getScanner(family);
+    Scan scan = new Scan();
+    scan.addFamily(family);
+    return getScanner(scan);
   }
 
   /**
@@ -492,7 +644,9 @@ public class HTable implements HTableInterface {
   @Override
   public ResultScanner getScanner(byte [] family, byte [] qualifier)
   throws IOException {
-    return table.getScanner(family, qualifier);
+    Scan scan = new Scan();
+    scan.addColumn(family, qualifier);
+    return getScanner(scan);
   }
 
   /**
@@ -500,7 +654,11 @@ public class HTable implements HTableInterface {
    */
   @Override
   public Result get(final Get get) throws IOException {
-    return table.get(get);
+    return new ServerCallable<Result>(connection, tableName, get.getRow(), operationTimeout) {
+          public Result call() throws IOException {
+            return server.get(location.getRegionInfo().getRegionName(), get);
+          }
+        }.withRetries();
   }
 
   /**
@@ -508,7 +666,21 @@ public class HTable implements HTableInterface {
    */
   @Override
   public Result[] get(List<Get> gets) throws IOException {
-    return table.get(gets);
+    try {
+      Object [] r1 = batch((List)gets);
+
+      // translate.
+      Result [] results = new Result[r1.length];
+      int i=0;
+      for (Object o : r1) {
+        // batch ensures if there is a failure we get an exception instead
+        results[i++] = (Result) o;
+      }
+
+      return results;
+    } catch (InterruptedException e) {
+      throw new IOException(e);
+    }
   }
 
   /**
@@ -517,16 +689,17 @@ public class HTable implements HTableInterface {
   @Override
   public void batch(final List<?extends Row> actions, final Object[] results)
       throws InterruptedException, IOException {
-    table.batch(actions, results);
+    connection.processBatch(actions, tableName, pool, results);
   }
 
   /**
    * {@inheritDoc}
    */
   @Override
-  public Object[] batch(final List<? extends Row> actions)
-    throws InterruptedException, IOException {
-    return table.batch(actions);
+  public Object[] batch(final List<? extends Row> actions) throws InterruptedException, IOException {
+    Object[] results = new Object[actions.size()];
+    connection.processBatch(actions, tableName, pool, results);
+    return results;
   }
 
   /**
@@ -535,7 +708,12 @@ public class HTable implements HTableInterface {
   @Override
   public void delete(final Delete delete)
   throws IOException {
-    table.delete(delete);
+    new ServerCallable<Boolean>(connection, tableName, delete.getRow(), operationTimeout) {
+          public Boolean call() throws IOException {
+            server.delete(location.getRegionInfo().getRegionName(), delete);
+            return null; // FindBugs NP_BOOLEAN_RETURN_NULL
+          }
+        }.withRetries();
   }
 
   /**
@@ -544,7 +722,22 @@ public class HTable implements HTableInterface {
   @Override
   public void delete(final List<Delete> deletes)
   throws IOException {
-    table.delete(deletes);
+    Object[] results = new Object[deletes.size()];
+    try {
+      connection.processBatch((List) deletes, tableName, pool, results);
+    } catch (InterruptedException e) {
+      throw new IOException(e);
+    } finally {
+      // mutate list so that it is empty for complete success, or contains only failed records
+      // results are returned in the same order as the requests in list
+      // walk the list backwards, so we can remove from list without impacting the indexes of earlier members
+      for (int i = results.length - 1; i>=0; i--) {
+        // if result is not null, it succeeded
+        if (results[i] instanceof Result) {
+          deletes.remove(i);
+        }
+      }
+    }
   }
 
   /**
@@ -552,7 +745,7 @@ public class HTable implements HTableInterface {
    */
   @Override
   public void put(final Put put) throws IOException {
-    table.put(put);
+    doPut(Arrays.asList(put));
   }
 
   /**
@@ -560,7 +753,25 @@ public class HTable implements HTableInterface {
    */
   @Override
   public void put(final List<Put> puts) throws IOException {
-    table.put(puts);
+    doPut(puts);
+  }
+
+  private void doPut(final List<Put> puts) throws IOException {
+    int n = 0;
+    for (Put put : puts) {
+      validatePut(put);
+      writeBuffer.add(put);
+      currentWriteBufferSize += put.heapSize();
+     
+      // we need to periodically see if the writebuffer is full instead of waiting until the end of the List
+      n++;
+      if (n % DOPUT_WB_CHECK == 0 && currentWriteBufferSize > writeBufferSize) {
+        flushCommits();
+      }
+    }
+    if (autoFlush || currentWriteBufferSize > writeBufferSize) {
+      flushCommits();
+    }
   }
 
   /**
@@ -568,7 +779,13 @@ public class HTable implements HTableInterface {
    */
   @Override
   public void mutateRow(final RowMutations rm) throws IOException {
-    table.mutateRow(rm);
+    new ServerCallable<Void>(connection, tableName, rm.getRow(),
+        operationTimeout) {
+      public Void call() throws IOException {
+        server.mutateRow(location.getRegionInfo().getRegionName(), rm);
+        return null;
+      }
+    }.withRetries();
   }
 
   /**
@@ -576,7 +793,16 @@ public class HTable implements HTableInterface {
    */
   @Override
   public Result append(final Append append) throws IOException {
-    return table.append(append);
+    if (append.numFamilies() == 0) {
+      throw new IOException(
+          "Invalid arguments to append, no columns specified");
+    }
+    return new ServerCallable<Result>(connection, tableName, append.getRow(), operationTimeout) {
+          public Result call() throws IOException {
+            return server.append(
+                location.getRegionInfo().getRegionName(), append);
+          }
+        }.withRetries();
   }
 
   /**
@@ -584,7 +810,16 @@ public class HTable implements HTableInterface {
    */
   @Override
   public Result increment(final Increment increment) throws IOException {
-    return table.increment(increment);
+    if (!increment.hasFamilies()) {
+      throw new IOException(
+          "Invalid arguments to increment, no columns specified");
+    }
+    return new ServerCallable<Result>(connection, tableName, increment.getRow(), operationTimeout) {
+          public Result call() throws IOException {
+            return server.increment(
+                location.getRegionInfo().getRegionName(), increment);
+          }
+        }.withRetries();
   }
 
   /**
@@ -604,7 +839,23 @@ public class HTable implements HTableInterface {
   public long incrementColumnValue(final byte [] row, final byte [] family,
       final byte [] qualifier, final long amount, final boolean writeToWAL)
   throws IOException {
-    return table.incrementColumnValue(row, family, qualifier, amount);
+    NullPointerException npe = null;
+    if (row == null) {
+      npe = new NullPointerException("row is null");
+    } else if (family == null) {
+      npe = new NullPointerException("column is null");
+    }
+    if (npe != null) {
+      throw new IOException(
+          "Invalid arguments to incrementColumnValue", npe);
+    }
+    return new ServerCallable<Long>(connection, tableName, row, operationTimeout) {
+          public Long call() throws IOException {
+            return server.incrementColumnValue(
+                location.getRegionInfo().getRegionName(), row, family,
+                qualifier, amount, writeToWAL);
+          }
+        }.withRetries();
   }
 
   /**
@@ -615,7 +866,12 @@ public class HTable implements HTableInterface {
       final byte [] family, final byte [] qualifier, final byte [] value,
       final Put put)
   throws IOException {
-    return table.checkAndPut(row, family, qualifier, value, put);
+    return new ServerCallable<Boolean>(connection, tableName, row, operationTimeout) {
+          public Boolean call() throws IOException {
+            return server.checkAndPut(location.getRegionInfo().getRegionName(),
+                row, family, qualifier, value, put) ? Boolean.TRUE : Boolean.FALSE;
+          }
+        }.withRetries();
   }
 
 
@@ -627,7 +883,14 @@ public class HTable implements HTableInterface {
       final byte [] family, final byte [] qualifier, final byte [] value,
       final Delete delete)
   throws IOException {
-    return table.checkAndDelete(row, family, qualifier, value, delete);
+    return new ServerCallable<Boolean>(connection, tableName, row, operationTimeout) {
+          public Boolean call() throws IOException {
+            return server.checkAndDelete(
+                location.getRegionInfo().getRegionName(),
+                row, family, qualifier, value, delete)
+            ? Boolean.TRUE : Boolean.FALSE;
+          }
+        }.withRetries();
   }
 
   /**
@@ -635,7 +898,12 @@ public class HTable implements HTableInterface {
    */
   @Override
   public boolean exists(final Get get) throws IOException {
-    return table.exists(get);
+    return new ServerCallable<Boolean>(connection, tableName, get.getRow(), operationTimeout) {
+          public Boolean call() throws IOException {
+            return server.
+                exists(location.getRegionInfo().getRegionName(), get);
+          }
+        }.withRetries();
   }
 
   /**
@@ -643,7 +911,36 @@ public class HTable implements HTableInterface {
    */
   @Override
   public void flushCommits() throws IOException {
-    table.flushCommits();
+    try {
+      Object[] results = new Object[writeBuffer.size()];
+      try {
+        this.connection.processBatch(writeBuffer, tableName, pool, results);
+      } catch (InterruptedException e) {
+        throw new IOException(e);
+      } finally {
+        // mutate list so that it is empty for complete success, or contains
+        // only failed records results are returned in the same order as the
+        // requests in list walk the list backwards, so we can remove from list
+        // without impacting the indexes of earlier members
+        for (int i = results.length - 1; i>=0; i--) {
+          if (results[i] instanceof Result) {
+            // successful Puts are removed from the list here.
+            writeBuffer.remove(i);
+          }
+        }
+      }
+    } finally {
+      if (clearBufferOnFail) {
+        writeBuffer.clear();
+        currentWriteBufferSize = 0;
+      } else {
+        // the write buffer was adjusted by processBatchOfPuts
+        currentWriteBufferSize = 0;
+        for (Put aPut : writeBuffer) {
+          currentWriteBufferSize += aPut.heapSize();
+        }
+      }
+    }
   }
 
   /**
@@ -651,7 +948,35 @@ public class HTable implements HTableInterface {
    */
   @Override
   public void close() throws IOException {
-    table.close();
+    if (this.closed) {
+      return;
+    }
+    flushCommits();
+    if (cleanupPoolOnClose) {
+      this.pool.shutdown();
+    }
+    if (cleanupConnectionOnClose) {
+      if (this.connection != null) {
+        this.connection.close();
+      }
+    }
+    this.closed = true;
+  }
+
+  // validate for well-formedness
+  private void validatePut(final Put put) throws IllegalArgumentException{
+    if (put.isEmpty()) {
+      throw new IllegalArgumentException("No columns to insert");
+    }
+    if (maxKeyValueSize > 0) {
+      for (List<KeyValue> list : put.getFamilyMap().values()) {
+        for (KeyValue kv : list) {
+          if (kv.getLength() > maxKeyValueSize) {
+            throw new IllegalArgumentException("KeyValue size too large");
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -660,7 +985,13 @@ public class HTable implements HTableInterface {
   @Override
   public RowLock lockRow(final byte [] row)
   throws IOException {
-    return table.lockRow(row);
+    return new ServerCallable<RowLock>(connection, tableName, row, operationTimeout) {
+        public RowLock call() throws IOException {
+          long lockId =
+              server.lockRow(location.getRegionInfo().getRegionName(), row);
+          return new RowLock(row,lockId);
+        }
+      }.withRetries();
   }
 
   /**
@@ -669,7 +1000,13 @@ public class HTable implements HTableInterface {
   @Override
   public void unlockRow(final RowLock rl)
   throws IOException {
-    table.unlockRow(rl);
+    new ServerCallable<Boolean>(connection, tableName, rl.getRow(), operationTimeout) {
+        public Boolean call() throws IOException {
+          server.unlockRow(location.getRegionInfo().getRegionName(),
+              rl.getLockId());
+          return null; // FindBugs NP_BOOLEAN_RETURN_NULL
+        }
+      }.withRetries();
   }
 
   /**
@@ -677,7 +1014,7 @@ public class HTable implements HTableInterface {
    */
   @Override
   public boolean isAutoFlush() {
-    return table.isAutoFlush();
+    return autoFlush;
   }
 
   /**
@@ -718,7 +1055,8 @@ public class HTable implements HTableInterface {
    * @see #flushCommits
    */
   public void setAutoFlush(boolean autoFlush, boolean clearBufferOnFail) {
-    table.setAutoFlush(autoFlush, clearBufferOnFail);
+    this.autoFlush = autoFlush;
+    this.clearBufferOnFail = autoFlush || clearBufferOnFail;
   }
 
   /**
@@ -729,7 +1067,7 @@ public class HTable implements HTableInterface {
    * @return The size of the write buffer in bytes.
    */
   public long getWriteBufferSize() {
-    return table.getWriteBufferSize();
+    return writeBufferSize;
   }
 
   /**
@@ -741,7 +1079,10 @@ public class HTable implements HTableInterface {
    * @throws IOException if a remote or network exception occurs.
    */
   public void setWriteBufferSize(long writeBufferSize) throws IOException {
-    table.setWriteBufferSize(writeBufferSize);
+    this.writeBufferSize = writeBufferSize;
+    if(currentWriteBufferSize > writeBufferSize) {
+      flushCommits();
+    }
   }
 
   /**
@@ -749,15 +1090,15 @@ public class HTable implements HTableInterface {
    * @return The current write buffer.
    */
   public ArrayList<Put> getWriteBuffer() {
-    return table.getWriteBuffer();
+    return writeBuffer;
   }
 
   /**
    * The pool is used for mutli requests for this HTable
    * @return the pool used for mutli
    */
-  ExecutorService getPool() {
-    return table.getPool();
+  public ExecutorService getPool() {
+    return this.pool;
   }
 
   /**
@@ -771,15 +1112,14 @@ public class HTable implements HTableInterface {
    */
   public static void setRegionCachePrefetch(final byte[] tableName,
       final boolean enable) throws IOException {
-    Class<? extends AbstractHTableInterface> c =
-        HTableFactoryEx.get().getImplementingClass(null, tableName);
-    try {
-      Method setRegionCachePrefetch = c.getDeclaredMethod("setRegionCachePrefetch",
-          new Class[] {byte[].class, boolean.class});
-      setRegionCachePrefetch.invoke(null, tableName, enable);
-    } catch (Exception e) {
-      throw (e instanceof IOException) ? (IOException)e : new IOException(e);
-    }
+    HConnectionManager.execute(new HConnectable<Void>(HBaseConfiguration
+        .create()) {
+      @Override
+      public Void connect(HConnection connection) throws IOException {
+        connection.setRegionCachePrefetch(tableName, enable);
+        return null;
+      }
+    });
   }
 
   /**
@@ -794,15 +1134,13 @@ public class HTable implements HTableInterface {
    */
   public static void setRegionCachePrefetch(final Configuration conf,
       final byte[] tableName, final boolean enable) throws IOException {
-    Class<? extends AbstractHTableInterface> c =
-        HTableFactoryEx.get().getImplementingClass(conf, tableName);
-    try {
-      Method setRegionCachePrefetch = c.getDeclaredMethod("setRegionCachePrefetch",
-          new Class[] {Configuration.class, byte[].class, boolean.class});
-      setRegionCachePrefetch.invoke(null, conf, tableName, enable);
-    } catch (Exception e) {
-      throw (e instanceof IOException) ? (IOException)e : new IOException(e);
-    }
+    HConnectionManager.execute(new HConnectable<Void>(conf) {
+      @Override
+      public Void connect(HConnection connection) throws IOException {
+        connection.setRegionCachePrefetch(tableName, enable);
+        return null;
+      }
+    });
   }
 
   /**
@@ -815,15 +1153,12 @@ public class HTable implements HTableInterface {
    */
   public static boolean getRegionCachePrefetch(final Configuration conf,
       final byte[] tableName) throws IOException {
-    Class<? extends AbstractHTableInterface> c =
-        HTableFactoryEx.get().getImplementingClass(conf, tableName);
-    try {
-      Method getRegionCachePrefetch = c.getDeclaredMethod("getRegionCachePrefetch",
-          new Class[] {Configuration.class, byte[].class});
-      return (Boolean) getRegionCachePrefetch.invoke(null, conf, tableName);
-    } catch (Exception e) {
-      throw (e instanceof IOException) ? (IOException)e : new IOException(e);
-    }
+    return HConnectionManager.execute(new HConnectable<Boolean>(conf) {
+      @Override
+      public Boolean connect(HConnection connection) throws IOException {
+        return connection.getRegionCachePrefetch(tableName);
+      }
+    });
   }
 
   /**
@@ -834,23 +1169,21 @@ public class HTable implements HTableInterface {
    * @throws IOException
    */
   public static boolean getRegionCachePrefetch(final byte[] tableName) throws IOException {
-    Class<? extends AbstractHTableInterface> c =
-        HTableFactoryEx.get().getImplementingClass(null, tableName);
-    try {
-      Method getRegionCachePrefetch = c.getDeclaredMethod("getRegionCachePrefetch",
-          new Class[] {byte[].class});
-      return (Boolean) getRegionCachePrefetch.invoke(null, tableName);
-    } catch (Exception e) {
-      throw (e instanceof IOException) ? (IOException)e : new IOException(e);
-    }
-  }
+    return HConnectionManager.execute(new HConnectable<Boolean>(
+        HBaseConfiguration.create()) {
+      @Override
+      public Boolean connect(HConnection connection) throws IOException {
+        return connection.getRegionCachePrefetch(tableName);
+      }
+    });
+ }
 
   /**
    * Explicitly clears the region cache to fetch the latest value from META.
    * This is a power user function: avoid unless you know the ramifications.
    */
   public void clearRegionCache() {
-    table.clearRegionCache();
+    this.connection.clearRegionCache();
   }
 
   /**
@@ -859,7 +1192,13 @@ public class HTable implements HTableInterface {
   @Override
   public <T extends CoprocessorProtocol> T coprocessorProxy(
       Class<T> protocol, byte[] row) {
-    return table.coprocessorProxy(protocol, row);
+    return (T)Proxy.newProxyInstance(this.getClass().getClassLoader(),
+        new Class[]{protocol},
+        new ExecRPCInvoker(configuration,
+            connection,
+            protocol,
+            tableName,
+            row));
   }
 
   /**
@@ -870,7 +1209,16 @@ public class HTable implements HTableInterface {
       Class<T> protocol, byte[] startKey, byte[] endKey,
       Batch.Call<T,R> callable)
       throws IOException, Throwable {
-    return table.coprocessorExec(protocol, startKey, endKey, callable);
+
+    final Map<byte[],R> results =  Collections.synchronizedMap(new TreeMap<byte[],R>(
+        Bytes.BYTES_COMPARATOR));
+    coprocessorExec(protocol, startKey, endKey, callable,
+        new Batch.Callback<R>(){
+      public void update(byte[] region, byte[] row, R value) {
+        results.put(region, value);
+      }
+    });
+    return results;
   }
 
   /**
@@ -881,16 +1229,50 @@ public class HTable implements HTableInterface {
       Class<T> protocol, byte[] startKey, byte[] endKey,
       Batch.Call<T,R> callable, Batch.Callback<R> callback)
       throws IOException, Throwable {
-    table.coprocessorExec(protocol, startKey, endKey,
-                             callable, callback);
+
+    // get regions covered by the row range
+    List<byte[]> keys = getStartKeysInRange(startKey, endKey);
+    connection.processExecs(protocol, keys, tableName, pool, callable,
+        callback);
+  }
+
+  private List<byte[]> getStartKeysInRange(byte[] start, byte[] end)
+  throws IOException {
+    Pair<byte[][],byte[][]> startEndKeys = getStartEndKeys();
+    byte[][] startKeys = startEndKeys.getFirst();
+    byte[][] endKeys = startEndKeys.getSecond();
+
+    if (start == null) {
+      start = HConstants.EMPTY_START_ROW;
+    }
+    if (end == null) {
+      end = HConstants.EMPTY_END_ROW;
+    }
+
+    List<byte[]> rangeKeys = new ArrayList<byte[]>();
+    for (int i=0; i<startKeys.length; i++) {
+      if (Bytes.compareTo(start, startKeys[i]) >= 0 ) {
+        if (Bytes.equals(endKeys[i], HConstants.EMPTY_END_ROW) ||
+            Bytes.compareTo(start, endKeys[i]) < 0) {
+          rangeKeys.add(start);
+        }
+      } else if (Bytes.equals(end, HConstants.EMPTY_END_ROW) ||
+          Bytes.compareTo(startKeys[i], end) <= 0) {
+        rangeKeys.add(startKeys[i]);
+      } else {
+        break; // past stop
+      }
+    }
+
+    return rangeKeys;
   }
 
   public void setOperationTimeout(int operationTimeout) {
-    table.setOperationTimeout(operationTimeout);
+    this.operationTimeout = operationTimeout;
   }
 
   public int getOperationTimeout() {
-    return table.getOperationTimeout();
+    return operationTimeout;
   }
 
 }

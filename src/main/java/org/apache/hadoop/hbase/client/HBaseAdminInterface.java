@@ -21,18 +21,12 @@ package org.apache.hadoop.hbase.client;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.ClusterStatus;
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
@@ -43,14 +37,10 @@ import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.UnknownRegionException;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
-import org.apache.hadoop.hbase.client.mapr.TableMappingRulesFactory;
-import org.apache.hadoop.hbase.client.mapr.TableMappingRulesInterface;
-import org.apache.hadoop.hbase.client.mapr.TableMappingRulesInterface.ClusterType;
 import org.apache.hadoop.hbase.ipc.CoprocessorProtocol;
 import org.apache.hadoop.hbase.ipc.HMasterInterface;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest.CompactionState;
 import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
-import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
 
 /**
@@ -62,107 +52,9 @@ import org.apache.hadoop.hbase.util.Pair;
  * <p>Currently HBaseAdmin instances are not expected to be long-lived.  For
  * example, an HBaseAdmin instance will not ride over a Master restart.
  */
-public class HBaseAdmin implements Abortable, Closeable {
-  private static final HBaseAdminFactory adminFactory = HBaseAdminFactory.get();
-  private static final Log LOG = LogFactory.getLog(HBaseAdmin.class);
-  private static final AtomicBoolean balancer_ = new AtomicBoolean();
-
-  private volatile HBaseAdminInterface apacheHBaseAdmin_ = null;
-  private volatile HBaseAdminInterface maprHBaseAdmin_ = null;
-
-  private Configuration conf_;
-  private TableMappingRulesInterface tableMappingRule_;
-
-  private volatile boolean isHbaseAvailable_ = true;
-  private volatile IOException hbaseIOException_ = null;
-
-  abstract class HBaseAdminConstructor {
-    abstract HBaseAdminInterface construct();
-  }
-  HBaseAdminConstructor adminConstrcutor_ = null;
-
-  /**
-   * Constructor
-   *
-   * @param c Configuration object
-   * @throws MasterNotRunningException if the master is not running
-   * @throws ZooKeeperConnectionException if unable to connect to zookeeper
-   */
-  public HBaseAdmin(Configuration c)
-  throws MasterNotRunningException, ZooKeeperConnectionException {
-    conf_ = c;
-    try {
-      tableMappingRule_ = TableMappingRulesFactory.create(conf_);
-      adminConstrcutor_ = new HBaseAdminConstructor() {
-        @Override
-        HBaseAdminInterface construct() {
-          return adminFactory.create(conf_,
-            TableMappingRulesInterface.HBASE_PREFIX);
-        }
-      };
-    } catch (IOException e) {
-      throw new RuntimeException("Unable to create TableMappingRules class", e);
-    }
-  }
-
- /**
-   * Constructor for externally managed HConnections.
-   * This constructor fails fast if the HMaster is not running.
-   * The HConnection can be re-used again in another attempt.
-   * This constructor fails fast.
-   *
-   * @param connection The HConnection instance to use
-   * @throws MasterNotRunningException if the master is not running
-   * @throws ZooKeeperConnectionException if unable to connect to zookeeper
-   */
-  public HBaseAdmin(HConnection connection)
-      throws MasterNotRunningException, ZooKeeperConnectionException {
-    conf_ = connection.getConfiguration();
-    try {
-      final HConnection conn = connection;
-      tableMappingRule_ = TableMappingRulesFactory.create(conf_);
-      adminConstrcutor_ = new HBaseAdminConstructor() {
-        @Override
-        HBaseAdminInterface construct() {
-          return adminFactory.create(conn,
-            TableMappingRulesInterface.HBASE_PREFIX);
-        }
-      };
-    } catch (IOException e) {
-      throw new RuntimeException("Unable to create TableMappingRules class", e);
-    }
-  }
-
-  @Override
-  public void abort(String why, Throwable e) {
-    try {
-      if (getApacheHBaseAdmin(false) != null) {
-        getApacheHBaseAdmin().abort(why, e);
-      }
-    } catch (IOException e1) {
-      LOG.warn("HBaseAdmin.abort: " + e1.getMessage());
-    }
-  }
-
-  @Override
-  public boolean isAborted(){
-    try {
-      return getApacheHBaseAdmin(false) == null || getApacheHBaseAdmin().isAborted();
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.isAborted: " + e.getMessage());
-    }
-    return true;
-  }
-
+public interface HBaseAdminInterface extends Abortable, Closeable {
   /** @return HConnection used by this object. */
-  public HConnection getConnection() {
-    try {
-      return (getApacheHBaseAdmin(false) != null) ? getApacheHBaseAdmin().getConnection() : null;
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.getConnection: " + e.getMessage());
-    }
-    return null;
-  }
+  public HConnection getConnection();
 
   /**
    * Get a connection to the currently set master.
@@ -174,27 +66,13 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   @Deprecated
   public HMasterInterface getMaster()
-  throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) != null) ? getApacheHBaseAdmin().getMaster() : null;
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.getMaster: " + e.getMessage());
-    }
-    return null;
-  }
+      throws MasterNotRunningException, ZooKeeperConnectionException;
 
   /** @return - true if the master server is running
    * @throws ZooKeeperConnectionException
    * @throws MasterNotRunningException */
   public boolean isMasterRunning()
-  throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin() == null) || getApacheHBaseAdmin().isMasterRunning();
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.isMasterRunning: " + e.getMessage());
-    }
-    return false;
-  }
+      throws MasterNotRunningException, ZooKeeperConnectionException;
 
   /**
    * @param tableName Table to check.
@@ -202,9 +80,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public boolean tableExists(final String tableName)
-  throws IOException {
-    return getAdmin(tableName).tableExists(tableName);
-  }
+      throws IOException;
 
   /**
    * @param tableName Table to check.
@@ -212,9 +88,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public boolean tableExists(final byte [] tableName)
-  throws IOException {
-    return tableExists(Bytes.toString(tableName));
-  }
+      throws IOException;
 
   /**
    * List all the userspace tables.  In other words, scan the META table.
@@ -226,11 +100,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return - returns an array of HTableDescriptors
    * @throws IOException if a remote or network exception occurs
    */
-  public HTableDescriptor[] listTables() throws IOException {
-    return (tableMappingRule_.isMapRDefault()) || (getApacheHBaseAdmin(false) == null)
-        ? getMaprHBaseAdmin().listTables() 
-            : getApacheHBaseAdmin().listTables();
-  }
+  public HTableDescriptor[] listTables() throws IOException;
 
   /**
    * List all the userspace tables matching the given pattern.
@@ -240,18 +110,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    * @see #listTables()
    */
-  public HTableDescriptor[] listTables(Pattern pattern) throws IOException {
-    if (tableMappingRule_.isMapRTable(pattern.pattern()) ||
-        getApacheHBaseAdmin(false) == null) {
-      return getMaprHBaseAdmin().listTables(pattern);
-    }
-    else {
-      if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().listTables(pattern);
-      }
-      return new HTableDescriptor[0];
-    }
-  }
+  public HTableDescriptor[] listTables(Pattern pattern) throws IOException;
 
   /**
    * List all the userspace tables matching the given regular expression.
@@ -261,18 +120,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    * @see #listTables(java.util.regex.Pattern)
    */
-  public HTableDescriptor[] listTables(String regex) throws IOException {
-    if (tableMappingRule_.isMapRTable(regex) ||
-          getApacheHBaseAdmin(false) == null) {
-      return getMaprHBaseAdmin().listTables(regex);
-    }
-    else {
-      if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().listTables(regex);
-      }
-      return new HTableDescriptor[0];
-    }
-  }
+  public HTableDescriptor[] listTables(String regex) throws IOException;
 
 
   /**
@@ -283,9 +131,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public HTableDescriptor getTableDescriptor(final byte [] tableName)
-  throws TableNotFoundException, IOException {
-      return getAdmin(tableName).getTableDescriptor(tableName);
-  }
+  throws TableNotFoundException, IOException;
 
   /**
    * Creates a new table.
@@ -300,10 +146,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * and attempt-at-creation).
    * @throws IOException if a remote or network exception occurs
    */
-  public void createTable(HTableDescriptor desc)
-  throws IOException {
-    getAdmin(desc.getAlias()).createTable(desc);
-  }
+  public void createTable(HTableDescriptor desc) throws IOException;
 
   /**
    * Creates a new table with the specified number of regions.  The start key
@@ -330,10 +173,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public void createTable(HTableDescriptor desc, byte [] startKey,
-      byte [] endKey, int numRegions)
-  throws IOException {
-    getAdmin(desc.getAlias()).createTable(desc, startKey, endKey, numRegions);
-  }
+      byte [] endKey, int numRegions) throws IOException;
 
   /**
    * Creates a new table with an initial set of empty regions defined by the
@@ -353,9 +193,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public void createTable(final HTableDescriptor desc, byte [][] splitKeys)
-  throws IOException {
-    getAdmin(desc.getAlias()).createTable(desc, splitKeys);
-  }
+  throws IOException;
 
   /**
    * Creates a new table but does not block and wait for it to come online.
@@ -374,9 +212,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public void createTableAsync(HTableDescriptor desc, byte [][] splitKeys)
-  throws IOException {
-    getAdmin(desc.getAlias()).createTableAsync(desc, splitKeys);
-  }
+  throws IOException;
 
   /**
    * Deletes a table.
@@ -385,9 +221,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @param tableName name of table to delete
    * @throws IOException if a remote or network exception occurs
    */
-  public void deleteTable(final String tableName) throws IOException {
-    getAdmin(tableName).deleteTable(tableName);
-  }
+  public void deleteTable(final String tableName) throws IOException;
 
   /**
    * Deletes a table.
@@ -396,9 +230,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @param tableName name of table to delete
    * @throws IOException if a remote or network exception occurs
    */
-  public void deleteTable(final byte [] tableName) throws IOException {
-    getAdmin(tableName).deleteTable(tableName);
-  }
+  public void deleteTable(final byte [] tableName) throws IOException;
 
   /**
    * Deletes tables matching the passed in pattern and wait on completion.
@@ -413,9 +245,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #deleteTables(java.util.regex.Pattern)
    * @see #deleteTable(java.lang.String)
    */
-  public HTableDescriptor[] deleteTables(String regex) throws IOException {
-    return getAdmin(regex).deleteTables(regex);
-  }
+  public HTableDescriptor[] deleteTables(String regex) throws IOException;
 
   /**
    * Delete tables matching the passed in pattern and wait on completion.
@@ -428,15 +258,10 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return Table descriptors for tables that couldn't be deleted
    * @throws IOException
    */
-  public HTableDescriptor[] deleteTables(Pattern pattern) throws IOException {
-    return getAdmin(pattern.pattern()).deleteTables(pattern);
-  }
+  public HTableDescriptor[] deleteTables(Pattern pattern) throws IOException;
 
 
-  public void enableTable(final String tableName)
-  throws IOException {
-    getAdmin(tableName).enableTable(tableName);
-  }
+  public void enableTable(final String tableName) throws IOException;
 
   /**
    * Enable a table.  May timeout.  Use {@link #enableTableAsync(byte[])}
@@ -451,15 +276,10 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #disableTable(byte[])
    * @see #enableTableAsync(byte[])
    */
-  public void enableTable(final byte [] tableName)
-  throws IOException {
-    getAdmin(tableName).enableTable(tableName);
-  }
+  public void enableTable(final byte [] tableName) throws IOException;
 
   public void enableTableAsync(final String tableName)
-  throws IOException {
-    getAdmin(tableName).enableTableAsync(tableName);
-  }
+  throws IOException;
 
   /**
    * Brings a table on-line (enables it).  Method returns immediately though
@@ -471,10 +291,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    * @since 0.90.0
    */
-  public void enableTableAsync(final byte [] tableName)
-  throws IOException {
-    getAdmin(tableName).enableTableAsync(tableName);
-  }
+  public void enableTableAsync(final byte [] tableName) throws IOException;
 
   /**
    * Enable tables matching the passed in pattern and wait on completion.
@@ -488,9 +305,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #enableTables(java.util.regex.Pattern)
    * @see #enableTable(java.lang.String)
    */
-  public HTableDescriptor[] enableTables(String regex) throws IOException {
-    return getAdmin(regex).enableTables(regex);
-  }
+  public HTableDescriptor[] enableTables(String regex) throws IOException;
 
   /**
    * Enable tables matching the passed in pattern and wait on completion.
@@ -502,13 +317,9 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @param pattern The pattern to match table names against
    * @throws IOException
    */
-  public HTableDescriptor[] enableTables(Pattern pattern) throws IOException {
-    return getAdmin(pattern.pattern()).enableTables(pattern);
-  }
+  public HTableDescriptor[] enableTables(Pattern pattern) throws IOException;
 
-  public void disableTableAsync(final String tableName) throws IOException {
-    getAdmin(tableName).disableTableAsync(tableName);
-  }
+  public void disableTableAsync(final String tableName) throws IOException;
 
   /**
    * Starts the disable of a table.  If it is being served, the master
@@ -523,14 +334,10 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #isTableEnabled(byte[])
    * @since 0.90.0
    */
-  public void disableTableAsync(final byte [] tableName) throws IOException {
-    getAdmin(tableName).disableTableAsync(tableName);
-  }
+  public void disableTableAsync(final byte [] tableName) throws IOException;
 
   public void disableTable(final String tableName)
-  throws IOException {
-    getAdmin(tableName).disableTable(tableName);
-  }
+  throws IOException;
 
   /**
    * Disable table and wait on completion.  May timeout eventually.  Use
@@ -544,9 +351,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * TableNotEnabledException means the table isn't in enabled state.
    */
   public void disableTable(final byte [] tableName)
-  throws IOException {
-    getAdmin(tableName).disableTable(tableName);
-  }
+  throws IOException;
 
   /**
    * Disable tables matching the passed in pattern and wait on completion.
@@ -561,9 +366,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #disableTables(java.util.regex.Pattern)
    * @see #disableTable(java.lang.String)
    */
-  public HTableDescriptor[] disableTables(String regex) throws IOException {
-    return getAdmin(regex).disableTables(regex);
-  }
+  public HTableDescriptor[] disableTables(String regex) throws IOException;
 
   /**
    * Disable tables matching the passed in pattern and wait on completion.
@@ -576,62 +379,49 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return Table descriptors for tables that couldn't be disabled
    * @throws IOException
    */
-  public HTableDescriptor[] disableTables(Pattern pattern) throws IOException {
-    return getAdmin(pattern.pattern()).disableTables(pattern);
-  }
+  public HTableDescriptor[] disableTables(Pattern pattern) throws IOException;
 
   /**
    * @param tableName name of table to check
    * @return true if table is on-line
    * @throws IOException if a remote or network exception occurs
    */
-  public boolean isTableEnabled(String tableName) throws IOException {
-    return getAdmin(tableName).isTableEnabled(tableName);
-  }
+  public boolean isTableEnabled(String tableName) throws IOException;
+
   /**
    * @param tableName name of table to check
    * @return true if table is on-line
    * @throws IOException if a remote or network exception occurs
    */
-  public boolean isTableEnabled(byte[] tableName) throws IOException {
-    return getAdmin(tableName).isTableEnabled(tableName);
-  }
+  public boolean isTableEnabled(byte[] tableName) throws IOException;
 
   /**
    * @param tableName name of table to check
    * @return true if table is off-line
    * @throws IOException if a remote or network exception occurs
    */
-  public boolean isTableDisabled(final String tableName) throws IOException {
-    return getAdmin(tableName).isTableDisabled(tableName);
-  }
+  public boolean isTableDisabled(final String tableName) throws IOException;
 
   /**
    * @param tableName name of table to check
    * @return true if table is off-line
    * @throws IOException if a remote or network exception occurs
    */
-  public boolean isTableDisabled(byte[] tableName) throws IOException {
-    return getAdmin(tableName).isTableDisabled(tableName);
-  }
+  public boolean isTableDisabled(byte[] tableName) throws IOException;
 
   /**
    * @param tableName name of table to check
    * @return true if all regions of the table are available
    * @throws IOException if a remote or network exception occurs
    */
-  public boolean isTableAvailable(byte[] tableName) throws IOException {
-    return getAdmin(tableName).isTableAvailable(tableName);
-  }
+  public boolean isTableAvailable(byte[] tableName) throws IOException;
 
   /**
    * @param tableName name of table to check
    * @return true if all regions of the table are available
    * @throws IOException if a remote or network exception occurs
    */
-  public boolean isTableAvailable(String tableName) throws IOException {
-    return getAdmin(tableName).isTableAvailable(tableName);
-  }
+  public boolean isTableAvailable(String tableName) throws IOException;
 
   /**
    * Get the status of alter command - indicates how many regions have received
@@ -646,9 +436,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    *           if a remote or network exception occurs
    */
   public Pair<Integer, Integer> getAlterStatus(final byte[] tableName)
-  throws IOException {
-    return getAdmin(tableName).getAlterStatus(tableName);
-  }
+  throws IOException;
 
   /**
    * Add a column to an existing table.
@@ -659,9 +447,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void addColumn(final String tableName, HColumnDescriptor column)
-  throws IOException {
-    getAdmin(tableName).addColumn(tableName, column);
-  }
+  throws IOException;
 
   /**
    * Add a column to an existing table.
@@ -672,9 +458,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void addColumn(final byte [] tableName, HColumnDescriptor column)
-  throws IOException {
-    getAdmin(tableName).addColumn(tableName, column);
-  }
+  throws IOException;
 
   /**
    * Delete a column from a table.
@@ -685,9 +469,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void deleteColumn(final String tableName, final String columnName)
-  throws IOException {
-    getAdmin(tableName).deleteColumn(tableName, columnName);
-  }
+  throws IOException;
 
   /**
    * Delete a column from a table.
@@ -698,9 +480,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void deleteColumn(final byte [] tableName, final byte [] columnName)
-  throws IOException {
-    getAdmin(tableName).deleteColumn(tableName, columnName);
-  }
+  throws IOException;
 
   /**
    * Modify an existing column family on a table.
@@ -711,9 +491,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void modifyColumn(final String tableName, HColumnDescriptor descriptor)
-  throws IOException {
-    getAdmin(tableName).modifyColumn(tableName, descriptor);
-  }
+  throws IOException;
 
   /**
    * Modify an existing column family on a table.
@@ -724,9 +502,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void modifyColumn(final byte [] tableName, HColumnDescriptor descriptor)
-  throws IOException {
-    getAdmin(tableName).modifyColumn(tableName, descriptor);
-  }
+  throws IOException;
 
   /**
    * Close a region. For expert-admins.  Runs close on the regionserver.  The
@@ -737,9 +513,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void closeRegion(final String regionname, final String serverName)
-  throws IOException {
-    getAdmin(regionname).closeRegion(regionname, serverName);
-  }
+  throws IOException;
 
   /**
    * Close a region.  For expert-admins  Runs close on the regionserver.  The
@@ -752,9 +526,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void closeRegion(final byte [] regionname, final String serverName)
-  throws IOException {
-    getAdmin(regionname).closeRegion(regionname, serverName);
-  }
+  throws IOException;
 
   /**
    * For expert-admins. Runs close on the regionserver. Closes a region based on
@@ -778,16 +550,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    *           if a remote or network exception occurs
    */
   public boolean closeRegionWithEncodedRegionName(final String encodedRegionName,
-      final String serverName) throws IOException {
-    if (!HRegionInfo.isEncodedName(encodedRegionName)) {
-      return getMaprHBaseAdmin().closeRegionWithEncodedRegionName(
-          encodedRegionName, serverName);
-    }
-    else {
-      return getApacheHBaseAdmin().closeRegionWithEncodedRegionName(
-          encodedRegionName, serverName);
-    }
-  }
+      final String serverName) throws IOException;
 
   /**
    * Close a region.  For expert-admins  Runs close on the regionserver.  The
@@ -797,9 +560,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public void closeRegion(final ServerName sn, final HRegionInfo hri)
-  throws IOException {
-    getAdmin(hri.getTableName()).closeRegion(sn, hri);
-  }
+  throws IOException;
 
   /**
    * Flush a table or an individual region.
@@ -810,9 +571,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void flush(final String tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).flush(tableNameOrRegionName);
-  }
+  throws IOException, InterruptedException;
 
   /**
    * Flush a table or an individual region.
@@ -823,9 +582,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void flush(final byte [] tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).flush(tableNameOrRegionName);
-  }
+  throws IOException, InterruptedException;
 
   /**
    * Compact a table or an individual region.
@@ -836,9 +593,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void compact(final String tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).compact(tableNameOrRegionName);
-  }
+  throws IOException, InterruptedException;
 
   /**
    * Compact a table or an individual region.
@@ -849,10 +604,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void compact(final byte [] tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).compact(tableNameOrRegionName);
-  }
-  
+  throws IOException, InterruptedException;
   /**
    * Compact a column family within a table or region.
    * Asynchronous operation.
@@ -863,9 +615,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void compact(String tableOrRegionName, String columnFamily)
-    throws IOException,  InterruptedException {
-    getAdmin(tableOrRegionName).compact(tableOrRegionName, columnFamily);
-  }
+    throws IOException,  InterruptedException;
 
   /**
    * Compact a column family within a table or region.
@@ -877,9 +627,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void compact(final byte [] tableNameOrRegionName, final byte[] columnFamily)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).compact(tableNameOrRegionName, columnFamily);
-  }
+  throws IOException, InterruptedException;
 
   /**
    * Major compact a table or an individual region.
@@ -890,9 +638,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void majorCompact(final String tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).majorCompact(tableNameOrRegionName);
-  }
+  throws IOException, InterruptedException;
 
   /**
    * Major compact a table or an individual region.
@@ -903,10 +649,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void majorCompact(final byte [] tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).majorCompact(tableNameOrRegionName);
-  }
-  
+  throws IOException, InterruptedException;
   /**
    * Major compact a column family within a table or region.
    * Asynchronous operation.
@@ -917,10 +660,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void majorCompact(final String tableNameOrRegionName,
-    final String columnFamily) throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).majorCompact(tableNameOrRegionName, columnFamily);
-  }
-
+    final String columnFamily) throws IOException, InterruptedException;
   /**
    * Major compact a column family within a table or region.
    * Asynchronous operation.
@@ -931,9 +671,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void majorCompact(final byte [] tableNameOrRegionName,
-    final byte[] columnFamily) throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).compact(tableNameOrRegionName, columnFamily);
-  }
+    final byte[] columnFamily) throws IOException, InterruptedException;
 
   /**
    * Move the region <code>r</code> to <code>dest</code>.
@@ -951,19 +689,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws MasterNotRunningException
    */
   public void move(final byte [] encodedRegionName, final byte [] destServerName)
-  throws UnknownRegionException, MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      if (!HRegionInfo.isEncodedName(encodedRegionName)) {
-        getMaprHBaseAdmin().move(encodedRegionName, destServerName);
-      }
-      else {
-        getApacheHBaseAdmin().move(encodedRegionName, destServerName);
-      }
-    } catch (IOException e) {
-      LOG.warn("Error while moving regions: " + e.getMessage());
-      throw new RuntimeException(e);
-    }
-  }
+  throws UnknownRegionException, MasterNotRunningException, ZooKeeperConnectionException;
 
   /**
    * @param regionName
@@ -973,9 +699,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public void assign(final byte[] regionName) throws MasterNotRunningException,
-      ZooKeeperConnectionException, IOException {
-    getAdmin(regionName).assign(regionName);
-  }
+      ZooKeeperConnectionException, IOException;
 
   /**
    * Unassign a region from current hosting regionserver.  Region will then be
@@ -992,9 +716,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public void unassign(final byte [] regionName, final boolean force)
-  throws MasterNotRunningException, ZooKeeperConnectionException, IOException {
-    getAdmin(regionName).unassign(regionName, force);
-  }
+  throws MasterNotRunningException, ZooKeeperConnectionException, IOException;
 
   /**
    * Turn the load balancer on or off.
@@ -1004,15 +726,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   @Deprecated
   public boolean balanceSwitch(final boolean b)
-  throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) != null)
-          ? getApacheHBaseAdmin().balanceSwitch(b) : balancer_.getAndSet(b);
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.balanceSwitch: " + e.getMessage());
-    }
-    return balancer_.getAndSet(b);
-  }
+  throws MasterNotRunningException, ZooKeeperConnectionException;
 
   /**
    * Turn the load balancer on or off.
@@ -1021,16 +735,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return Previous balancer value
    */
   public boolean setBalancerRunning(final boolean on, final boolean synchronous)
-  throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) != null)
-          ? getApacheHBaseAdmin().setBalancerRunning(on, synchronous)
-              : balancer_.getAndSet(on);
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.setBalancerRunning: " + e.getMessage());
-    }
-    return balancer_.getAndSet(on);
-  }
+  throws MasterNotRunningException, ZooKeeperConnectionException;
 
   /**
    * Invoke the balancer.  Will run the balancer and if regions to move, it will
@@ -1039,14 +744,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return True if balancer ran, false otherwise.
    */
   public boolean balancer()
-  throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) == null) || getApacheHBaseAdmin().balancer();
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.balancer: " + e.getMessage());
-    }
-    return false;
-  }
+  throws MasterNotRunningException, ZooKeeperConnectionException;
 
   /**
    * Split a table or an individual region.
@@ -1057,9 +755,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void split(final String tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName);
-  }
+  throws IOException, InterruptedException;
 
   /**
    * Split a table or an individual region.  Implicitly finds an optimal split
@@ -1070,14 +766,10 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException
    */
   public void split(final byte [] tableNameOrRegionName)
-  throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName);
-  }
+  throws IOException, InterruptedException;
 
   public void split(final String tableNameOrRegionName,
-    final String splitPoint) throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName, splitPoint);
-  }
+    final String splitPoint) throws IOException, InterruptedException;
 
   /**
    * Split a table or an individual region.
@@ -1089,9 +781,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws InterruptedException interrupt exception occurred
    */
   public void split(final byte [] tableNameOrRegionName,
-      final byte [] splitPoint) throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName, splitPoint);
-  }
+      final byte [] splitPoint) throws IOException, InterruptedException;
 
   /**
    * Modify an existing table, more IRB friendly version.
@@ -1103,9 +793,8 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void modifyTable(final byte [] tableName, HTableDescriptor htd)
-  throws IOException {
-    getAdmin(tableName).modifyTable(tableName, htd);
-  }
+  throws IOException;
+
 
   /**
    * @param tableNameOrRegionName Name of a table or name of a region.
@@ -1117,19 +806,13 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   Pair<HRegionInfo, ServerName> getRegion(final byte[] tableNameOrRegionName,
-      final CatalogTracker ct) throws IOException {
-    return getAdmin(tableNameOrRegionName).getRegion(tableNameOrRegionName, ct);
-  }
+      final CatalogTracker ct) throws IOException;
 
   /**
    * Shuts down the HBase cluster
    * @throws IOException if a remote or network exception occurs
    */
-  public synchronized void shutdown() throws IOException {
-    if (getApacheHBaseAdmin(false) != null) {
-      getApacheHBaseAdmin().shutdown();
-    }
-  }
+  public void shutdown() throws IOException;
 
   /**
    * Shuts down the current HBase master only.
@@ -1137,11 +820,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #shutdown()
    * @throws IOException if a remote or network exception occurs
    */
-  public synchronized void stopMaster() throws IOException {
-    if (getApacheHBaseAdmin(false) != null) {
-      getApacheHBaseAdmin().stopMaster();
-    }
-  }
+  public void stopMaster() throws IOException;
 
   /**
    * Stop the designated regionserver
@@ -1149,54 +828,19 @@ public class HBaseAdmin implements Abortable, Closeable {
    * <code>example.org:1234</code>
    * @throws IOException if a remote or network exception occurs
    */
-  public synchronized void stopRegionServer(final String hostnamePort)
-  throws IOException {
-    if (getApacheHBaseAdmin(false) != null) {
-      getApacheHBaseAdmin().stopRegionServer(hostnamePort);
-    }
-  }
+  public void stopRegionServer(final String hostnamePort)
+  throws IOException;
 
   /**
    * @return cluster status
    * @throws IOException if a remote or network exception occurs
    */
-  public ClusterStatus getClusterStatus() throws IOException {
-    return (getApacheHBaseAdmin(false) != null)
-        ? getApacheHBaseAdmin().getClusterStatus() : null;
-  }
+  public ClusterStatus getClusterStatus() throws IOException;
 
   /**
    * @return Configuration used by the instance.
    */
-  public Configuration getConfiguration() {
-    return conf_;
-  }
-
-  /**
-   * Check to see if HBase is running. Throw an exception if not.
-   *
-   * @param conf system configuration
-   * @throws MasterNotRunningException if the master is not running
-   * @throws ZooKeeperConnectionException if unable to connect to zookeeper
-   */
-  public static void checkHBaseAvailable(Configuration conf)
-      throws MasterNotRunningException, ZooKeeperConnectionException {
-    //  No-op if MapR is the default engine
-    ClusterType clusterType = ClusterType.HBASE_ONLY;
-    try {
-      clusterType = TableMappingRulesFactory.create(conf).getClusterType();
-    } catch (IOException e) { throw new RuntimeException(e);}
-    if (clusterType != ClusterType.MAPR_ONLY) {
-      Configuration copyOfConf = HBaseConfiguration.create(conf);
-      copyOfConf.setInt("hbase.client.retries.number", 1);
-      HBaseAdminImpl admin = new HBaseAdminImpl(copyOfConf);
-      try {
-        admin.close();
-      } catch (IOException ioe) {
-        LOG.info("Failed to close connection", ioe);
-      }
-    }
-  }
+  public Configuration getConfiguration();
 
   /**
    * get the regions of a given table.
@@ -1206,18 +850,9 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public List<HRegionInfo> getTableRegions(final byte[] tableName)
-  throws IOException {
-    return getAdmin(tableName).getTableRegions(tableName);
-  }
+  throws IOException;
 
-  public void close() throws IOException {
-    if (apacheHBaseAdmin_ != null) {
-      apacheHBaseAdmin_.close();
-    }
-    if (maprHBaseAdmin_ != null) {
-      maprHBaseAdmin_.close();
-    }
-  }
+  public void close() throws IOException;
 
  /**
  * Get tableDescriptors
@@ -1226,19 +861,7 @@ public class HBaseAdmin implements Abortable, Closeable {
  * @throws IOException if a remote or network exception occurs
  */
   public HTableDescriptor[] getTableDescriptors(List<String> tableNames)
-  throws IOException {
-    List<HTableDescriptor> list = new ArrayList<HTableDescriptor>();
-    for (String table : tableNames) {
-      byte[] tableName = Bytes.toBytes(table);
-      if (tableMappingRule_.isMapRTable(tableName)) {
-        list.add(getMaprHBaseAdmin().getTableDescriptor(tableName));
-      }
-      else {
-        list.add(getApacheHBaseAdmin().getTableDescriptor(tableName));
-      }
-    }
-    return list.toArray(new HTableDescriptor[list.size()]);
-  }
+  throws IOException;
 
   /**
    * Roll the log writer. That is, start writing log messages to a new file.
@@ -1253,24 +876,10 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    * @throws FailedLogCloseException
    */
- public synchronized  byte[][] rollHLogWriter(String serverName)
-      throws IOException, FailedLogCloseException {
-   if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().rollHLogWriter(serverName);
-   }
-   return null;
-  }
+ public byte[][] rollHLogWriter(String serverName)
+      throws IOException, FailedLogCloseException;
 
-  public String[] getMasterCoprocessors() {
-    try {
-      if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().getMasterCoprocessors();
-      }
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.getMasterCoprocessors: " + e.getMessage());
-    }
-    return null;
-  }
+  public String[] getMasterCoprocessors();
 
   /**
    * Get the current compaction state of a table or region.
@@ -1282,9 +891,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return the current compaction state
    */
   public CompactionState getCompactionState(final String tableNameOrRegionName)
-      throws IOException, InterruptedException {
-    return getAdmin(tableNameOrRegionName).getCompactionState(tableNameOrRegionName);
-  }
+      throws IOException, InterruptedException;
 
   /**
    * Get the current compaction state of a table or region.
@@ -1296,9 +903,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @return the current compaction state
    */
   public CompactionState getCompactionState(final byte [] tableNameOrRegionName)
-      throws IOException, InterruptedException {
-    return getAdmin(tableNameOrRegionName).getCompactionState(tableNameOrRegionName);
-  }
+      throws IOException, InterruptedException;
 
   /**
    * Creates and returns a proxy to the CoprocessorProtocol instance running in the
@@ -1307,91 +912,5 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @param protocol The class or interface defining the remote protocol
    * @return A CoprocessorProtocol instance
    */
-  public <T extends CoprocessorProtocol> T coprocessorProxy(
-      Class<T> protocol) {
-    try {
-      return (T) getApacheHBaseAdmin().coprocessorProxy(protocol);
-    } catch (IOException e) {
-      LOG.warn("Unable to create coprocessorProxy, HBase may not be available", e);
-      throw new RuntimeException(e);
-    }
-  }
-
-  protected HBaseAdminInterface getMaprHBaseAdmin() {
-    if (tableMappingRule_.getClusterType() != ClusterType.HBASE_ONLY) {
-      HBaseAdminInterface admin = maprHBaseAdmin_;
-      if (admin == null) {
-        synchronized (this) {
-          admin = maprHBaseAdmin_;
-          if (admin == null) {
-            admin = maprHBaseAdmin_ = adminFactory.create(conf_,
-                TableMappingRulesInterface.MAPRFS_PREFIX);
-          }
-        }
-      }
-      return admin;
-    }
-    return null;
-  }
-
-  protected HBaseAdminInterface getAdmin(String tableName) throws IOException {
-    return (tableMappingRule_.isMapRTable(HRegionInfo.getTableName(tableName)))
-        ? getMaprHBaseAdmin()
-            : getApacheHBaseAdmin();
-  }
-
-  protected HBaseAdminInterface getAdmin(byte[] tableName) throws IOException {
-    return getAdmin(Bytes.toString(tableName));
-  }
-
-  protected HBaseAdminInterface getApacheHBaseAdmin() throws IOException {
-    return getApacheHBaseAdmin(true);
-  }
-
-  protected HBaseAdminInterface getApacheHBaseAdmin(boolean throwException)
-      throws IOException {
-    HBaseAdminInterface admin = null;
-    if (!isHbaseAvailable_) {
-      if (throwException) {
-        throw hbaseIOException_;
-      }
-    }
-    else if (tableMappingRule_.getClusterType() != ClusterType.MAPR_ONLY) {
-      if ((admin = apacheHBaseAdmin_) == null) {
-        synchronized (this) {
-          admin = apacheHBaseAdmin_;
-          if (admin == null) {
-            try {
-              admin = apacheHBaseAdmin_ = adminConstrcutor_.construct();
-              return admin;
-            }
-            catch (Throwable t) {
-              IOException ioe = null;
-              Throwable ex = t;
-              while (ex != null) {
-                if (ex instanceof IOException) {
-                  ioe = (IOException) ex;
-                  break;
-                }
-                else if (ex instanceof InvocationTargetException) {
-                  ex = ((InvocationTargetException)ex).getTargetException();
-                }
-                else {
-                  ex = ex.getCause();
-                }
-              }
-              admin = null;
-              isHbaseAvailable_ = false;
-              hbaseIOException_ = (ioe != null) ? ioe : new IOException(t);
-              LOG.warn(ex.getMessage(), ex);
-              if (throwException) {
-                throw hbaseIOException_;
-              }
-            }
-          }
-        }
-      }
-    }
-    return admin;
-  }
+  public <T extends CoprocessorProtocol> T coprocessorProxy(Class<T> protocol);
 }
