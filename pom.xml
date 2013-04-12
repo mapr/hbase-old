@@ -1003,7 +1003,7 @@
     </buildDate>
     <compileSource>1.6</compileSource>
     <apache.git.tag>0.94.5</apache.git.tag>
-    <mapr.hadoop.version>0.20.2-2.1.2-SNAPSHOT</mapr.hadoop.version>
+    <mapr.hadoop.version>1.0.3-mapr-3.0.0-SNAPSHOT</mapr.hadoop.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
