@@ -415,6 +415,90 @@ public class KeyValue implements Writable, HeapSize {
     this.offset = 0;
   }
 
+  /* MapR changes to contructor to use ByteBuffer */
+  // AH TODO type for get??
+  public KeyValue(ByteBuffer bbuf,
+                  final byte[] key,
+                  final int keyoff, final int keylen, // if key[] is set then these are ignored
+                  final byte [] family, // AH TODO
+                  final int coff, final int qlength,
+                  final int voff, final int vlength,
+                  final long timestamp) {
+    // AH TODO type for get??
+    Type type = Type.Put;
+    final int rlength;
+    if (key != null) {
+      rlength = key.length;
+    } else {
+      rlength = keylen;
+    }
+
+    if (rlength > Short.MAX_VALUE) {
+      throw new IllegalArgumentException("Row > " + Short.MAX_VALUE);
+    }
+    // Family length AH TODO
+    final int flength = family == null ? 0 : family.length;
+
+    if (flength > Byte.MAX_VALUE) {
+      throw new IllegalArgumentException("Family > " + Byte.MAX_VALUE);
+    }
+    // Qualifier length
+    if (qlength > Integer.MAX_VALUE - rlength - flength) {
+      throw new IllegalArgumentException("Qualifier > " + Integer.MAX_VALUE);
+    }
+    // Key length
+    long longkeylength = KEY_INFRASTRUCTURE_SIZE + rlength + flength + qlength;
+    if (longkeylength > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException("keylength " + longkeylength + " > " +
+        Integer.MAX_VALUE);
+    }
+    int keylength = (int)longkeylength;
+
+    // Value length
+    if (vlength > HConstants.MAXIMUM_VALUE_LENGTH) { // FindBugs INT_VACUOUS_COMPARISON
+      throw new IllegalArgumentException("Valuer > " +
+          HConstants.MAXIMUM_VALUE_LENGTH);
+    }
+
+    // Allocate right-sized byte array.
+    this.bytes = new byte[KEYVALUE_INFRASTRUCTURE_SIZE + keylength + vlength];
+    // Write key, value and key row length.
+    int pos = 0;
+    pos = Bytes.putInt(bytes, pos, keylength);
+    pos = Bytes.putInt(bytes, pos, vlength);
+    pos = Bytes.putShort(bytes, pos, (short)(rlength & 0x0000ffff));
+    if (key != null) {
+      // copy key
+      pos = Bytes.putBytes(bytes, pos, key, 0, rlength);
+    } else {
+      bbuf.position(keyoff);
+      bbuf.get(bytes, pos, rlength);
+      pos += rlength;
+    }
+
+    pos = Bytes.putByte(bytes, pos, (byte)(flength & 0x0000ff));
+    if(flength != 0) {
+      // copy family AH TODO foffset
+      pos = Bytes.putBytes(bytes, pos, family, 0, flength);
+    }
+    if(qlength != 0) {
+      // copy column
+      bbuf.position(coff);
+      bbuf.get(bytes, pos, qlength);
+      pos += qlength;
+    }
+    pos = Bytes.putLong(bytes, pos, timestamp);
+    pos = Bytes.putByte(bytes, pos, type.getCode());
+    if (vlength > 0) {
+      // copy value
+      bbuf.position(voff);
+      bbuf.get(bytes, pos, vlength);
+      pos += vlength;
+    }
+    this.length = bytes.length;
+    this.offset = 0;
+  }
+
   /**
    * Write KeyValue format into a byte array.
    *

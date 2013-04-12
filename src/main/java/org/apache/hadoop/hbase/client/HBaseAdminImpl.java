@@ -19,37 +19,51 @@
  */
 package org.apache.hadoop.hbase.client;
 
-import java.io.Closeable;
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
-import java.util.ArrayList;
+import java.io.InterruptedIOException;
+import java.lang.reflect.UndeclaredThrowableException;
+import java.net.SocketTimeoutException;
+import java.util.Arrays;
+import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.ClusterStatus;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.MasterNotRunningException;
+import org.apache.hadoop.hbase.NotServingRegionException;
+import org.apache.hadoop.hbase.RegionException;
+import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableExistsException;
+import org.apache.hadoop.hbase.TableNotEnabledException;
 import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.UnknownRegionException;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
-import org.apache.hadoop.hbase.client.mapr.TableMappingRulesFactory;
-import org.apache.hadoop.hbase.client.mapr.TableMappingRulesInterface;
-import org.apache.hadoop.hbase.client.mapr.TableMappingRulesInterface.ClusterType;
+import org.apache.hadoop.hbase.catalog.CatalogTracker;
+import org.apache.hadoop.hbase.catalog.MetaReader;
+import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
+import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
 import org.apache.hadoop.hbase.ipc.HMasterInterface;
+import org.apache.hadoop.hbase.ipc.HRegionInterface;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest.CompactionState;
 import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
+import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.Writables;
+import org.apache.hadoop.ipc.RemoteException;
+import org.apache.hadoop.util.StringUtils;
 
 /**
  * Provides an interface to manage HBase database table metadata + general
@@ -60,19 +74,18 @@ import org.apache.hadoop.hbase.util.Pair;
  * <p>Currently HBaseAdmin instances are not expected to be long-lived.  For
  * example, an HBaseAdmin instance will not ride over a Master restart.
  */
-public class HBaseAdmin implements Abortable, Closeable {
-  private static final HBaseAdminFactory adminFactory = HBaseAdminFactory.get();
+public class HBaseAdminImpl implements HBaseAdminInterface {
   private static final Log LOG = LogFactory.getLog(HBaseAdmin.class);
-  private static final AtomicBoolean balancer_ = new AtomicBoolean();
-
-  private volatile HBaseAdminInterface apacheHBaseAdmin_ = null;
-  private volatile HBaseAdminInterface maprHBaseAdmin_ = null;
-
-  private Configuration conf_;
-  private TableMappingRulesInterface tableMappingRule_;
-
-  private volatile boolean isHbaseAvailable_ = true;
-  private volatile IOException hbaseIOException_ = null;
+//  private final HConnection connection;
+  private HConnection connection;
+  private volatile Configuration conf;
+  private final long pause;
+  private final int numRetries;
+  // Some operations can take a long time such as disable of big table.
+  // numRetries is for 'normal' stuff... Mutliply by this factor when
+  // want to wait a long time.
+  private final int retryLongerMultiplier;
+  private boolean aborted;
 
   /**
    * Constructor
@@ -81,45 +94,82 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws MasterNotRunningException if the master is not running
    * @throws ZooKeeperConnectionException if unable to connect to zookeeper
    */
-  public HBaseAdmin(Configuration conf)
+  public HBaseAdminImpl(Configuration c)
   throws MasterNotRunningException, ZooKeeperConnectionException {
-    conf_ = conf;
-    try {
-      tableMappingRule_ = TableMappingRulesFactory.create(conf_);
-    } catch (IOException e) {
-      throw new RuntimeException("Unable to create TableMappingRules class", e);
+    this.conf = HBaseConfiguration.create(c);
+      this.connection = HConnectionManager.getConnection(this.conf);
+    this.pause = this.conf.getLong("hbase.client.pause", 1000);
+    this.numRetries = this.conf.getInt("hbase.client.retries.number", 10);
+    this.retryLongerMultiplier = this.conf.getInt(
+        "hbase.client.retries.longer.multiplier", 10);
+    int tries = 0;
+    for (; tries < numRetries; ++tries) {
+      try {
+        this.connection.getMaster();
+        break;
+      } catch (MasterNotRunningException mnre) {
+        HConnectionManager.deleteStaleConnection(this.connection);
+        this.connection = HConnectionManager.getConnection(this.conf);
+      } catch (UndeclaredThrowableException ute) {
+        HConnectionManager.deleteStaleConnection(this.connection);
+        this.connection = HConnectionManager.getConnection(this.conf);
+      }
+      try { // Sleep
+        Thread.sleep(getPauseTime(tries));
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        // we should delete connection between client and zookeeper
+        HConnectionManager.deleteStaleConnection(this.connection);
+        throw new MasterNotRunningException("Interrupted");
+      }
     }
+    if (tries >= numRetries) {
+      // we should delete connection between client and zookeeper
+      HConnectionManager.deleteStaleConnection(this.connection);
+      throw new MasterNotRunningException("Retried " + numRetries + " times");
+    }
+  }
+
+  /**
+   * @return A new CatalogTracker instance; call {@link #cleanupCatalogTracker(CatalogTracker)}
+   * to cleanup the returned catalog tracker.
+   * @throws ZooKeeperConnectionException
+   * @throws IOException
+   * @see #cleanupCatalogTracker(CatalogTracker)
+   */
+  private synchronized CatalogTracker getCatalogTracker()
+  throws ZooKeeperConnectionException, IOException {
+    CatalogTracker ct = null;
+    try {
+      ct = new CatalogTracker(this.conf);
+      ct.start();
+    } catch (InterruptedException e) {
+      // Let it out as an IOE for now until we redo all so tolerate IEs
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted", e);
+    }
+    return ct;
+  }
+
+  private void cleanupCatalogTracker(final CatalogTracker ct) {
+    ct.stop();
   }
 
   @Override
   public void abort(String why, Throwable e) {
-    try {
-      if (getApacheHBaseAdmin(false) != null) {
-        getApacheHBaseAdmin().abort(why, e);
-      }
-    } catch (IOException e1) {
-      LOG.warn("HBaseAdmin.abort: " + e1.getMessage());
-    }
+    // Currently does nothing but throw the passed message and exception
+    this.aborted = true;
+    throw new RuntimeException(why, e);
   }
 
   @Override
   public boolean isAborted(){
-    try {
-      return getApacheHBaseAdmin(false) == null || getApacheHBaseAdmin().isAborted();
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.isAborted: " + e.getMessage());
-    }
-    return true;
+    return this.aborted;
   }
 
   /** @return HConnection used by this object. */
   public HConnection getConnection() {
-    try {
-      return (getApacheHBaseAdmin(false) != null) ? getApacheHBaseAdmin().getConnection() : null;
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.getConnection: " + e.getMessage());
-    }
-    return null;
+    return connection;
   }
 
   /**
@@ -130,12 +180,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public HMasterInterface getMaster()
   throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) != null) ? getApacheHBaseAdmin().getMaster() : null;
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.getMaster: " + e.getMessage());
-    }
-    return null;
+    return this.connection.getMaster();
   }
 
   /** @return - true if the master server is running
@@ -143,12 +188,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws MasterNotRunningException */
   public boolean isMasterRunning()
   throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin() == null) || getApacheHBaseAdmin().isMasterRunning();
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.isMasterRunning: " + e.getMessage());
-    }
-    return false;
+    return this.connection.isMasterRunning();
   }
 
   /**
@@ -158,7 +198,14 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public boolean tableExists(final String tableName)
   throws IOException {
-    return getAdmin(tableName).tableExists(tableName);
+    boolean b = false;
+    CatalogTracker ct = getCatalogTracker();
+    try {
+      b = MetaReader.tableExists(ct, FSUtils.adjustTableNameString(tableName));
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
+    return b;
   }
 
   /**
@@ -182,9 +229,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public HTableDescriptor[] listTables() throws IOException {
-    return (tableMappingRule_.isMapRDefault()) || (getApacheHBaseAdmin(false) == null)
-        ? getMaprHBaseAdmin().listTables()
-            : getApacheHBaseAdmin().listTables();
+    return this.connection.listTables();
   }
 
   /**
@@ -196,16 +241,14 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #listTables()
    */
   public HTableDescriptor[] listTables(Pattern pattern) throws IOException {
-    if (tableMappingRule_.isMapRTable(pattern.pattern()) ||
-        getApacheHBaseAdmin(false) == null) {
-      return getMaprHBaseAdmin().listTables(pattern);
-    }
-    else {
-      if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().listTables(pattern);
+    List<HTableDescriptor> matched = new LinkedList<HTableDescriptor>();
+    HTableDescriptor[] tables = listTables();
+    for (HTableDescriptor table : tables) {
+      if (pattern.matcher(table.getNameAsString()).matches()) {
+        matched.add(table);
       }
-      return new HTableDescriptor[0];
     }
+    return matched.toArray(new HTableDescriptor[matched.size()]);
   }
 
   /**
@@ -217,16 +260,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #listTables(java.util.regex.Pattern)
    */
   public HTableDescriptor[] listTables(String regex) throws IOException {
-    if (tableMappingRule_.isMapRTable(regex) ||
-          getApacheHBaseAdmin(false) == null) {
-      return getMaprHBaseAdmin().listTables(regex);
-    }
-    else {
-      if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().listTables(regex);
-      }
-      return new HTableDescriptor[0];
-    }
+    return listTables(Pattern.compile(regex));
   }
 
 
@@ -239,7 +273,15 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public HTableDescriptor getTableDescriptor(final byte [] tableName)
   throws TableNotFoundException, IOException {
-      return getAdmin(tableName).getTableDescriptor(tableName);
+    return this.connection.getHTableDescriptor(FSUtils.adjustTableName(tableName));
+  }
+
+  private long getPauseTime(int tries) {
+    int triesCount = tries;
+    if (triesCount >= HConstants.RETRY_BACKOFF.length) {
+      triesCount = HConstants.RETRY_BACKOFF.length - 1;
+    }
+    return this.pause * HConstants.RETRY_BACKOFF[triesCount];
   }
 
   /**
@@ -257,7 +299,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void createTable(HTableDescriptor desc)
   throws IOException {
-    getAdmin(desc.getAlias()).createTable(desc);
+    createTable(desc, null);
   }
 
   /**
@@ -287,7 +329,17 @@ public class HBaseAdmin implements Abortable, Closeable {
   public void createTable(HTableDescriptor desc, byte [] startKey,
       byte [] endKey, int numRegions)
   throws IOException {
-    getAdmin(desc.getAlias()).createTable(desc, startKey, endKey, numRegions);
+    HTableDescriptor.isLegalTableName(desc.getName());
+    if(numRegions < 3) {
+      throw new IllegalArgumentException("Must create at least three regions");
+    } else if(Bytes.compareTo(startKey, endKey) >= 0) {
+      throw new IllegalArgumentException("Start key must be smaller than end key");
+    }
+    byte [][] splitKeys = Bytes.split(startKey, endKey, numRegions - 3);
+    if(splitKeys == null || splitKeys.length != numRegions - 1) {
+      throw new IllegalArgumentException("Unable to split key range into enough regions");
+    }
+    createTable(desc, splitKeys);
   }
 
   /**
@@ -307,7 +359,82 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void createTable(final HTableDescriptor desc, byte [][] splitKeys)
   throws IOException {
-    getAdmin(desc.getAlias()).createTable(desc, splitKeys);
+    final byte[] table_name = FSUtils.adjustTableName(desc.getName());
+    HTableDescriptor.isLegalTableName(table_name);
+    try {
+      createTableAsync(desc, splitKeys);
+    } catch (SocketTimeoutException ste) {
+      LOG.warn("Creating " + desc.getNameAsString() + " took too long", ste);
+    }
+    int numRegs = splitKeys == null ? 1 : splitKeys.length + 1;
+    int prevRegCount = 0;
+    boolean doneWithMetaScan = false;
+    for (int tries = 0; tries < this.numRetries * this.retryLongerMultiplier;
+      ++tries) {
+      if (!doneWithMetaScan) {
+        // Wait for new table to come on-line
+        final AtomicInteger actualRegCount = new AtomicInteger(0);
+        MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+          @Override
+          public boolean processRow(Result rowResult) throws IOException {
+            HRegionInfo info = Writables.getHRegionInfoOrNull(
+              rowResult.getValue(HConstants.CATALOG_FAMILY,
+              HConstants.REGIONINFO_QUALIFIER));
+            //If regioninfo is null, skip this row
+            if (null == info) {
+              return true;
+            }
+            if (!(Bytes.equals(info.getTableName(), table_name))) {
+              return false;
+            }
+            String hostAndPort = null;
+            byte [] value = rowResult.getValue(HConstants.CATALOG_FAMILY,
+              HConstants.SERVER_QUALIFIER);
+            // Make sure that regions are assigned to server
+            if (value != null && value.length > 0) {
+              hostAndPort = Bytes.toString(value);
+            }
+            if (!(info.isOffline() || info.isSplit()) && hostAndPort != null) {
+              actualRegCount.incrementAndGet();
+            }
+            return true;
+          }
+        };
+        MetaScanner.metaScan(conf, visitor, table_name);
+        if (actualRegCount.get() != numRegs) {
+          if (tries == this.numRetries * this.retryLongerMultiplier - 1) {
+            throw new RegionOfflineException("Only " + actualRegCount.get() +
+              " of " + numRegs + " regions are online; retries exhausted.");
+          }
+          try { // Sleep
+            Thread.sleep(getPauseTime(tries));
+          } catch (InterruptedException e) {
+            throw new InterruptedIOException("Interrupted when opening" +
+              " regions; " + actualRegCount.get() + " of " + numRegs +
+              " regions processed so far");
+          }
+          if (actualRegCount.get() > prevRegCount) { // Making progress
+            prevRegCount = actualRegCount.get();
+            tries = -1;
+          }
+        } else {
+          doneWithMetaScan = true;
+          tries = -1;
+        }
+      } else if (isTableEnabled(table_name)) {
+        return;
+      } else {
+        try { // Sleep
+          Thread.sleep(getPauseTime(tries));
+        } catch (InterruptedException e) {
+          throw new InterruptedIOException("Interrupted when waiting" +
+            " for table to be enabled; meta scan was done");
+        }
+      }
+    }
+    throw new TableNotEnabledException(
+      "Retries exhausted while still waiting for table: "
+      + desc.getNameAsString() + " to be enabled");
   }
 
   /**
@@ -327,7 +454,26 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void createTableAsync(HTableDescriptor desc, byte [][] splitKeys)
   throws IOException {
-    getAdmin(desc.getAlias()).createTableAsync(desc, splitKeys);
+    final byte[] table_name = FSUtils.adjustTableName(desc.getName());
+    HTableDescriptor.isLegalTableName(table_name);
+    if(splitKeys != null && splitKeys.length > 1) {
+      Arrays.sort(splitKeys, Bytes.BYTES_COMPARATOR);
+      // Verify there are no duplicate split keys
+      byte [] lastKey = null;
+      for(byte [] splitKey : splitKeys) {
+        if(lastKey != null && Bytes.equals(splitKey, lastKey)) {
+          throw new IllegalArgumentException("All split keys must be unique, " +
+            "found duplicate: " + Bytes.toStringBinary(splitKey) +
+            ", " + Bytes.toStringBinary(lastKey));
+        }
+        lastKey = splitKey;
+      }
+    }
+    try {
+      getMaster().createTable(desc, splitKeys);
+    } catch (RemoteException e) {
+      throw e.unwrapRemoteException();
+    }
   }
 
   /**
@@ -338,7 +484,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void deleteTable(final String tableName) throws IOException {
-    getAdmin(tableName).deleteTable(tableName);
+    deleteTable(Bytes.toBytes(tableName));
   }
 
   /**
@@ -349,7 +495,78 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void deleteTable(final byte [] tableName) throws IOException {
-    getAdmin(tableName).deleteTable(tableName);
+    isMasterRunning();
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    HTableDescriptor.isLegalTableName(table_name);
+    HRegionLocation firstMetaServer = getFirstMetaServerForTable(table_name);
+    boolean tableExists = true;
+    try {
+      getMaster().deleteTable(table_name);
+    } catch (RemoteException e) {
+      throw RemoteExceptionHandler.decodeRemoteException(e);
+    }
+    // Wait until all regions deleted
+    HRegionInterface server =
+      connection.getHRegionConnection(firstMetaServer.getHostname(), firstMetaServer.getPort());
+    for (int tries = 0; tries < (this.numRetries * this.retryLongerMultiplier); tries++) {
+      long scannerId = -1L;
+      try {
+
+        Scan scan = MetaReader.getScanForTableName(table_name);
+        scan.addColumn(HConstants.CATALOG_FAMILY,
+            HConstants.REGIONINFO_QUALIFIER);
+        scannerId = server.openScanner(
+          firstMetaServer.getRegionInfo().getRegionName(), scan);
+        // Get a batch at a time.
+        Result values = server.next(scannerId);
+
+        // let us wait until .META. table is updated and
+        // HMaster removes the table from its HTableDescriptors
+        if (values == null) {
+          tableExists = false;
+          HTableDescriptor[] htds = getMaster().getHTableDescriptors();
+          if (htds != null && htds.length > 0) {
+            for (HTableDescriptor htd: htds) {
+              if (Bytes.equals(table_name, htd.getName())) {
+                tableExists = true;
+                break;
+              }
+            }
+          }
+          if (!tableExists) {
+            break;
+          }
+        }
+      } catch (IOException ex) {
+        if(tries == numRetries - 1) {           // no more tries left
+          if (ex instanceof RemoteException) {
+            ex = RemoteExceptionHandler.decodeRemoteException((RemoteException) ex);
+          }
+          throw ex;
+        }
+      } finally {
+        if (scannerId != -1L) {
+          try {
+            server.close(scannerId);
+          } catch (Exception ex) {
+            LOG.warn(ex);
+          }
+        }
+      }
+      try {
+        Thread.sleep(getPauseTime(tries));
+      } catch (InterruptedException e) {
+        // continue
+      }
+    }
+
+    if (tableExists) {
+      throw new IOException("Retries exhausted, it took too long to wait"+
+        " for the table " + Bytes.toString(table_name) + " to be deleted.");
+    }
+    // Delete cached information to prevent clients from using old locations
+    this.connection.clearRegionCache(table_name);
+    LOG.info("Deleted " + Bytes.toString(table_name));
   }
 
   /**
@@ -366,7 +583,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #deleteTable(java.lang.String)
    */
   public HTableDescriptor[] deleteTables(String regex) throws IOException {
-    return getAdmin(regex).deleteTables(regex);
+    return deleteTables(Pattern.compile(regex));
   }
 
   /**
@@ -381,13 +598,22 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public HTableDescriptor[] deleteTables(Pattern pattern) throws IOException {
-    return getAdmin(pattern.pattern()).deleteTables(pattern);
+    List<HTableDescriptor> failed = new LinkedList<HTableDescriptor>();
+    for (HTableDescriptor table : listTables(pattern)) {
+      try {
+        deleteTable(table.getName());
+      } catch (IOException ex) {
+        LOG.info("Failed to delete table " + table.getNameAsString(), ex);
+        failed.add(table);
+      }
+    }
+    return failed.toArray(new HTableDescriptor[failed.size()]);
   }
 
 
   public void enableTable(final String tableName)
   throws IOException {
-    getAdmin(tableName).enableTable(tableName);
+    enableTable(Bytes.toBytes(tableName));
   }
 
   /**
@@ -405,12 +631,40 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void enableTable(final byte [] tableName)
   throws IOException {
-    getAdmin(tableName).enableTable(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    enableTableAsync(table_name);
+
+    // Wait until all regions are enabled
+    boolean enabled = false;
+    for (int tries = 0; tries < (this.numRetries * this.retryLongerMultiplier); tries++) {
+      enabled = isTableEnabled(table_name);
+      if (enabled) {
+        break;
+      }
+      long sleep = getPauseTime(tries);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Sleeping= " + sleep + "ms, waiting for all regions to be " +
+          "enabled in " + Bytes.toString(table_name));
+      }
+      try {
+        Thread.sleep(sleep);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        // Do this conversion rather than let it out because do not want to
+        // change the method signature.
+        throw new IOException("Interrupted", e);
+      }
+    }
+    if (!enabled) {
+      throw new IOException("Unable to enable table " +
+        Bytes.toString(table_name));
+    }
+    LOG.info("Enabled table " + Bytes.toString(table_name));
   }
 
   public void enableTableAsync(final String tableName)
   throws IOException {
-    getAdmin(tableName).enableTableAsync(tableName);
+    enableTableAsync(Bytes.toBytes(tableName));
   }
 
   /**
@@ -425,7 +679,15 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void enableTableAsync(final byte [] tableName)
   throws IOException {
-    getAdmin(tableName).enableTableAsync(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    HTableDescriptor.isLegalTableName(table_name);
+    isMasterRunning();
+    try {
+      getMaster().enableTable(table_name);
+    } catch (RemoteException e) {
+      throw e.unwrapRemoteException();
+    }
+    LOG.info("Started enable of " + Bytes.toString(table_name));
   }
 
   /**
@@ -441,7 +703,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #enableTable(java.lang.String)
    */
   public HTableDescriptor[] enableTables(String regex) throws IOException {
-    return getAdmin(regex).enableTables(regex);
+    return enableTables(Pattern.compile(regex));
   }
 
   /**
@@ -455,11 +717,22 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public HTableDescriptor[] enableTables(Pattern pattern) throws IOException {
-    return getAdmin(pattern.pattern()).enableTables(pattern);
+    List<HTableDescriptor> failed = new LinkedList<HTableDescriptor>();
+    for (HTableDescriptor table : listTables(pattern)) {
+      if (isTableDisabled(table.getName())) {
+        try {
+          enableTable(table.getName());
+        } catch (IOException ex) {
+          LOG.info("Failed to enable table " + table.getNameAsString(), ex);
+          failed.add(table);
+        }
+      }
+    }
+    return failed.toArray(new HTableDescriptor[failed.size()]);
   }
 
   public void disableTableAsync(final String tableName) throws IOException {
-    getAdmin(tableName).disableTableAsync(tableName);
+    disableTableAsync(Bytes.toBytes(tableName));
   }
 
   /**
@@ -476,12 +749,20 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @since 0.90.0
    */
   public void disableTableAsync(final byte [] tableName) throws IOException {
-    getAdmin(tableName).disableTableAsync(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    HTableDescriptor.isLegalTableName(table_name);
+    isMasterRunning();
+    try {
+      getMaster().disableTable(table_name);
+    } catch (RemoteException e) {
+      throw e.unwrapRemoteException();
+    }
+    LOG.info("Started disable of " + Bytes.toString(table_name));
   }
 
   public void disableTable(final String tableName)
   throws IOException {
-    getAdmin(tableName).disableTable(tableName);
+    disableTable(Bytes.toBytes(tableName));
   }
 
   /**
@@ -497,7 +778,34 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void disableTable(final byte [] tableName)
   throws IOException {
-    getAdmin(tableName).disableTable(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    disableTableAsync(table_name);
+    // Wait until table is disabled
+    boolean disabled = false;
+    for (int tries = 0; tries < (this.numRetries * this.retryLongerMultiplier); tries++) {
+      disabled = isTableDisabled(table_name);
+      if (disabled) {
+        break;
+      }
+      long sleep = getPauseTime(tries);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Sleeping= " + sleep + "ms, waiting for all regions to be " +
+          "disabled in " + Bytes.toString(table_name));
+      }
+      try {
+        Thread.sleep(sleep);
+      } catch (InterruptedException e) {
+        // Do this conversion rather than let it out because do not want to
+        // change the method signature.
+        Thread.currentThread().interrupt();
+        throw new IOException("Interrupted", e);
+      }
+    }
+    if (!disabled) {
+      throw new RegionException("Retries exhausted, it took too long to wait"+
+        " for the table " + Bytes.toString(table_name) + " to be disabled.");
+    }
+    LOG.info("Disabled " + Bytes.toString(table_name));
   }
 
   /**
@@ -514,7 +822,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @see #disableTable(java.lang.String)
    */
   public HTableDescriptor[] disableTables(String regex) throws IOException {
-    return getAdmin(regex).disableTables(regex);
+    return disableTables(Pattern.compile(regex));
   }
 
   /**
@@ -529,7 +837,18 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException
    */
   public HTableDescriptor[] disableTables(Pattern pattern) throws IOException {
-    return getAdmin(pattern.pattern()).disableTables(pattern);
+    List<HTableDescriptor> failed = new LinkedList<HTableDescriptor>();
+    for (HTableDescriptor table : listTables(pattern)) {
+      if (isTableEnabled(table.getName())) {
+        try {
+          disableTable(table.getName());
+        } catch (IOException ex) {
+          LOG.info("Failed to disable table " + table.getNameAsString(), ex);
+          failed.add(table);
+        }
+      }
+    }
+    return failed.toArray(new HTableDescriptor[failed.size()]);
   }
 
   /**
@@ -538,7 +857,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableEnabled(String tableName) throws IOException {
-    return getAdmin(tableName).isTableEnabled(tableName);
+    return isTableEnabled(Bytes.toBytes(tableName));
   }
   /**
    * @param tableName name of table to check
@@ -546,7 +865,11 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableEnabled(byte[] tableName) throws IOException {
-    return getAdmin(tableName).isTableEnabled(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    if (!HTableDescriptor.isMetaTable(table_name)) {
+      HTableDescriptor.isLegalTableName(table_name);
+    }
+    return connection.isTableEnabled(table_name);
   }
 
   /**
@@ -555,7 +878,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableDisabled(final String tableName) throws IOException {
-    return getAdmin(tableName).isTableDisabled(tableName);
+    return isTableDisabled(Bytes.toBytes(tableName));
   }
 
   /**
@@ -564,7 +887,11 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableDisabled(byte[] tableName) throws IOException {
-    return getAdmin(tableName).isTableDisabled(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    if (!HTableDescriptor.isMetaTable(table_name)) {
+      HTableDescriptor.isLegalTableName(table_name);
+    }
+    return connection.isTableDisabled(table_name);
   }
 
   /**
@@ -573,7 +900,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableAvailable(byte[] tableName) throws IOException {
-    return getAdmin(tableName).isTableAvailable(tableName);
+    return connection.isTableAvailable(FSUtils.adjustTableName(tableName));
   }
 
   /**
@@ -582,7 +909,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public boolean isTableAvailable(String tableName) throws IOException {
-    return getAdmin(tableName).isTableAvailable(tableName);
+    return connection.isTableAvailable(Bytes.toBytes(tableName));
   }
 
   /**
@@ -599,7 +926,13 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public Pair<Integer, Integer> getAlterStatus(final byte[] tableName)
   throws IOException {
-    return getAdmin(tableName).getAlterStatus(tableName);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    HTableDescriptor.isLegalTableName(table_name);
+    try {
+      return getMaster().getAlterStatus(table_name);
+    } catch (RemoteException e) {
+      throw RemoteExceptionHandler.decodeRemoteException(e);
+    }
   }
 
   /**
@@ -612,7 +945,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void addColumn(final String tableName, HColumnDescriptor column)
   throws IOException {
-    getAdmin(tableName).addColumn(tableName, column);
+    addColumn(Bytes.toBytes(tableName), column);
   }
 
   /**
@@ -625,7 +958,13 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void addColumn(final byte [] tableName, HColumnDescriptor column)
   throws IOException {
-    getAdmin(tableName).addColumn(tableName, column);
+    final byte[] table_name = FSUtils.adjustTableName(tableName);
+    HTableDescriptor.isLegalTableName(table_name);
+    try {
+      getMaster().addColumn(table_name, column);
+    } catch (RemoteException e) {
+      throw RemoteExceptionHandler.decodeRemoteException(e);
+    }
   }
 
   /**
@@ -638,7 +977,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void deleteColumn(final String tableName, final String columnName)
   throws IOException {
-    getAdmin(tableName).deleteColumn(tableName, columnName);
+    deleteColumn(Bytes.toBytes(tableName), Bytes.toBytes(columnName));
   }
 
   /**
@@ -651,7 +990,11 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void deleteColumn(final byte [] tableName, final byte [] columnName)
   throws IOException {
-    getAdmin(tableName).deleteColumn(tableName, columnName);
+    try {
+      getMaster().deleteColumn(FSUtils.adjustTableName(tableName), columnName);
+    } catch (RemoteException e) {
+      throw RemoteExceptionHandler.decodeRemoteException(e);
+    }
   }
 
   /**
@@ -664,7 +1007,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void modifyColumn(final String tableName, HColumnDescriptor descriptor)
   throws IOException {
-    getAdmin(tableName).modifyColumn(tableName, descriptor);
+    modifyColumn(Bytes.toBytes(tableName), descriptor);
   }
 
   /**
@@ -677,7 +1020,14 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void modifyColumn(final byte [] tableName, HColumnDescriptor descriptor)
   throws IOException {
-    getAdmin(tableName).modifyColumn(tableName, descriptor);
+    try {
+      getMaster().modifyColumn(FSUtils.adjustTableName(tableName), descriptor);
+    } catch (RemoteException re) {
+      // Convert RE exceptions in here; client shouldn't have to deal with them,
+      // at least w/ the type of exceptions that come out of this method:
+      // TableNotFoundException, etc.
+      throw RemoteExceptionHandler.decodeRemoteException(re);
+    }
   }
 
   /**
@@ -690,7 +1040,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void closeRegion(final String regionname, final String serverName)
   throws IOException {
-    getAdmin(regionname).closeRegion(regionname, serverName);
+    closeRegion(Bytes.toBytes(regionname), serverName);
   }
 
   /**
@@ -705,7 +1055,28 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void closeRegion(final byte [] regionname, final String serverName)
   throws IOException {
-    getAdmin(regionname).closeRegion(regionname, serverName);
+    CatalogTracker ct = getCatalogTracker();
+    try {
+      if (serverName != null) {
+        Pair<HRegionInfo, ServerName> pair = MetaReader.getRegion(ct, regionname);
+        if (pair == null || pair.getFirst() == null) {
+          LOG.info("No region in .META. for " +
+            Bytes.toStringBinary(regionname) + "; pair=" + pair);
+        } else {
+          closeRegion(new ServerName(serverName), pair.getFirst());
+        }
+      } else {
+        Pair<HRegionInfo, ServerName> pair = MetaReader.getRegion(ct, regionname);
+        if (pair == null || pair.getSecond() == null) {
+          LOG.info("No server in .META. for " +
+            Bytes.toStringBinary(regionname) + "; pair=" + pair);
+        } else {
+          closeRegion(pair.getSecond(), pair.getFirst());
+        }
+      }
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
   }
 
   /**
@@ -731,14 +1102,20 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public boolean closeRegionWithEncodedRegionName(final String encodedRegionName,
       final String serverName) throws IOException {
-    if (!HRegionInfo.isEncodedName(encodedRegionName)) {
-      return getMaprHBaseAdmin().closeRegionWithEncodedRegionName(
-          encodedRegionName, serverName);
+    byte[] encodedRegionNameInBytes = Bytes.toBytes(encodedRegionName);
+    if (null == serverName || ("").equals(serverName.trim())) {
+      throw new IllegalArgumentException(
+          "The servername cannot be null or empty.");
     }
-    else {
-      return getApacheHBaseAdmin().closeRegionWithEncodedRegionName(
-          encodedRegionName, serverName);
+    ServerName sn = new ServerName(serverName);
+    HRegionInterface rs = this.connection.getHRegionConnection(
+        sn.getHostname(), sn.getPort());
+    // Close the region without updating zk state.
+    boolean isRegionClosed = rs.closeRegion(encodedRegionNameInBytes, false);
+    if (false == isRegionClosed) {
+      LOG.error("Not able to close the region " + encodedRegionName + ".");
     }
+    return isRegionClosed;
   }
 
   /**
@@ -750,7 +1127,10 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void closeRegion(final ServerName sn, final HRegionInfo hri)
   throws IOException {
-    getAdmin(hri.getTableName()).closeRegion(sn, hri);
+    HRegionInterface rs =
+      this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+    // Close the region without updating zk state.
+    rs.closeRegion(hri, false);
   }
 
   /**
@@ -763,7 +1143,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void flush(final String tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).flush(tableNameOrRegionName);
+    flush(Bytes.toBytes(tableNameOrRegionName));
   }
 
   /**
@@ -776,7 +1156,47 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void flush(final byte [] tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).flush(tableNameOrRegionName);
+    CatalogTracker ct = getCatalogTracker();
+    final byte[] table_region_name = FSUtils.adjustTableName(tableNameOrRegionName);
+    boolean isRegionName = isRegionName(table_region_name, ct);
+    try {
+      if (isRegionName) {
+        Pair<HRegionInfo, ServerName> pair =
+          MetaReader.getRegion(ct, table_region_name);
+        if (pair == null || pair.getSecond() == null) {
+          LOG.info("No server in .META. for " +
+            Bytes.toStringBinary(table_region_name) + "; pair=" + pair);
+        } else {
+          flush(pair.getSecond(), pair.getFirst());
+        }
+      } else {
+        final String tableName = tableNameString(table_region_name, ct);
+        List<Pair<HRegionInfo, ServerName>> pairs =
+          MetaReader.getTableRegionsAndLocations(ct,
+              tableName);
+        for (Pair<HRegionInfo, ServerName> pair: pairs) {
+          if (pair.getFirst().isOffline()) continue;
+          if (pair.getSecond() == null) continue;
+          try {
+            flush(pair.getSecond(), pair.getFirst());
+          } catch (NotServingRegionException e) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Trying to flush " + pair.getFirst() + ": " +
+                StringUtils.stringifyException(e));
+            }
+          }
+        }
+      }
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
+  }
+
+  private void flush(final ServerName sn, final HRegionInfo hri)
+  throws IOException {
+    HRegionInterface rs =
+      this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+    rs.flushRegion(hri);
   }
 
   /**
@@ -789,7 +1209,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void compact(final String tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).compact(tableNameOrRegionName);
+    compact(Bytes.toBytes(tableNameOrRegionName));
   }
 
   /**
@@ -802,7 +1222,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void compact(final byte [] tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).compact(tableNameOrRegionName);
+    compact(tableNameOrRegionName, false);
   }
 
   /**
@@ -815,7 +1235,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void majorCompact(final String tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).majorCompact(tableNameOrRegionName);
+    majorCompact(Bytes.toBytes(tableNameOrRegionName));
   }
 
   /**
@@ -828,7 +1248,62 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void majorCompact(final byte [] tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).majorCompact(tableNameOrRegionName);
+    compact(tableNameOrRegionName, true);
+  }
+
+  /**
+   * Compact a table or an individual region.
+   * Asynchronous operation.
+   *
+   * @param tableNameOrRegionName table or region to compact
+   * @param major True if we are to do a major compaction.
+   * @throws IOException if a remote or network exception occurs
+   * @throws InterruptedException
+   */
+  public void compact(final byte [] tableNameOrRegionName, final boolean major)
+  throws IOException, InterruptedException {
+    CatalogTracker ct = getCatalogTracker();
+    final byte[] table_region_name = FSUtils.adjustTableName(tableNameOrRegionName);
+    try {
+      if (isRegionName(table_region_name, ct)) {
+        Pair<HRegionInfo, ServerName> pair =
+          MetaReader.getRegion(ct, table_region_name);
+        if (pair == null || pair.getSecond() == null) {
+          LOG.info("No server in .META. for " +
+            Bytes.toStringBinary(table_region_name) + "; pair=" + pair);
+        } else {
+          compact(pair.getSecond(), pair.getFirst(), major);
+        }
+      } else {
+        final String tableName = tableNameString(table_region_name, ct);
+        List<Pair<HRegionInfo, ServerName>> pairs =
+          MetaReader.getTableRegionsAndLocations(ct,
+              tableName);
+        for (Pair<HRegionInfo, ServerName> pair: pairs) {
+          if (pair.getFirst().isOffline()) continue;
+          if (pair.getSecond() == null) continue;
+          try {
+            compact(pair.getSecond(), pair.getFirst(), major);
+          } catch (NotServingRegionException e) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Trying to" + (major ? " major" : "") + " compact " +
+                pair.getFirst() + ": " +
+                StringUtils.stringifyException(e));
+            }
+          }
+        }
+      }
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
+  }
+
+  private void compact(final ServerName sn, final HRegionInfo hri,
+      final boolean major)
+  throws IOException {
+    HRegionInterface rs =
+      this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+    rs.compactRegion(hri, major);
   }
 
   /**
@@ -848,17 +1323,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void move(final byte [] encodedRegionName, final byte [] destServerName)
   throws UnknownRegionException, MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      if (!HRegionInfo.isEncodedName(encodedRegionName)) {
-        getMaprHBaseAdmin().move(encodedRegionName, destServerName);
-      }
-      else {
-        getApacheHBaseAdmin().move(encodedRegionName, destServerName);
-      }
-    } catch (IOException e) {
-      LOG.warn("Error while moving regions: " + e.getMessage());
-      throw new RuntimeException(e);
-    }
+    getMaster().move(encodedRegionName, destServerName);
   }
 
   /**
@@ -870,7 +1335,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void assign(final byte[] regionName) throws MasterNotRunningException,
       ZooKeeperConnectionException, IOException {
-    getAdmin(regionName).assign(regionName);
+    getMaster().assign(regionName);
   }
 
   /**
@@ -889,7 +1354,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void unassign(final byte [] regionName, final boolean force)
   throws MasterNotRunningException, ZooKeeperConnectionException, IOException {
-    getAdmin(regionName).unassign(regionName, force);
+    getMaster().unassign(regionName, force);
   }
 
   /**
@@ -899,13 +1364,18 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public boolean balanceSwitch(final boolean b)
   throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) != null)
-          ? getApacheHBaseAdmin().balanceSwitch(b) : balancer_.getAndSet(b);
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.balanceSwitch: " + e.getMessage());
-    }
-    return balancer_.getAndSet(b);
+    return getMaster().balanceSwitch(b);
+  }
+
+  /**
+   * Turn the load balancer on or off.
+   * @param on If true, enable balancer. If false, disable balancer.
+   * @param synchronous If true, it waits until current balance() call, if outstanding, to return.
+   * @return Previous balancer value
+   */
+  public boolean setBalancerRunning(final boolean on, final boolean synchronous)
+  throws MasterNotRunningException, ZooKeeperConnectionException {
+    return balanceSwitch(on);
   }
 
   /**
@@ -916,12 +1386,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public boolean balancer()
   throws MasterNotRunningException, ZooKeeperConnectionException {
-    try {
-      return (getApacheHBaseAdmin(false) == null) || getApacheHBaseAdmin().balancer();
-    } catch (IOException e) {
-      LOG.warn("HBaseAdmin.balancer: " + e.getMessage());
-    }
-    return false;
+    return getMaster().balance();
   }
 
   /**
@@ -934,7 +1399,7 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void split(final String tableNameOrRegionName)
   throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName);
+    split(Bytes.toBytes(tableNameOrRegionName));
   }
 
   /**
@@ -952,7 +1417,7 @@ public class HBaseAdmin implements Abortable, Closeable {
 
   public void split(final String tableNameOrRegionName,
     final String splitPoint) throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName, splitPoint);
+    split(Bytes.toBytes(tableNameOrRegionName), Bytes.toBytes(splitPoint));
   }
 
   /**
@@ -966,7 +1431,46 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void split(final byte [] tableNameOrRegionName,
       final byte [] splitPoint) throws IOException, InterruptedException {
-    getAdmin(tableNameOrRegionName).split(tableNameOrRegionName, splitPoint);
+    CatalogTracker ct = getCatalogTracker();
+    final byte[] table_region_name = FSUtils.adjustTableName(tableNameOrRegionName);
+    try {
+      if (isRegionName(table_region_name, ct)) {
+        // Its a possible region name.
+        Pair<HRegionInfo, ServerName> pair =
+          MetaReader.getRegion(ct, table_region_name);
+        if (pair == null || pair.getSecond() == null) {
+          LOG.info("No server in .META. for " +
+            Bytes.toStringBinary(table_region_name) + "; pair=" + pair);
+        } else {
+          split(pair.getSecond(), pair.getFirst(), splitPoint);
+        }
+      } else {
+        final String tableName = tableNameString(table_region_name, ct);
+        List<Pair<HRegionInfo, ServerName>> pairs =
+          MetaReader.getTableRegionsAndLocations(ct,
+              tableName);
+        for (Pair<HRegionInfo, ServerName> pair: pairs) {
+          // May not be a server for a particular row
+          if (pair.getSecond() == null) continue;
+          HRegionInfo r = pair.getFirst();
+          // check for parents
+          if (r.isSplitParent()) continue;
+          // if a split point given, only split that particular region
+          if (splitPoint != null && !r.containsRow(splitPoint)) continue;
+          // call out to region server to do split now
+          split(pair.getSecond(), pair.getFirst(), splitPoint);
+        }
+      }
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
+  }
+
+  private void split(final ServerName sn, final HRegionInfo hri,
+      byte[] splitPoint) throws IOException {
+    HRegionInterface rs =
+      this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+    rs.splitRegion(hri, splitPoint);
   }
 
   /**
@@ -980,7 +1484,51 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public void modifyTable(final byte [] tableName, HTableDescriptor htd)
   throws IOException {
-    getAdmin(tableName).modifyTable(tableName, htd);
+    try {
+      getMaster().modifyTable(FSUtils.adjustTableName(tableName), htd);
+    } catch (RemoteException re) {
+      // Convert RE exceptions in here; client shouldn't have to deal with them,
+      // at least w/ the type of exceptions that come out of this method:
+      // TableNotFoundException, etc.
+      throw RemoteExceptionHandler.decodeRemoteException(re);
+    }
+  }
+
+  /**
+   * @param tableNameOrRegionName Name of a table or name of a region.
+   * @param ct A {@link #CatalogTracker} instance (caller of this method usually has one).
+   * @return True if <code>tableNameOrRegionName</code> is a verified region
+   * name (we call {@link #MetaReader.getRegion(CatalogTracker catalogTracker,
+   * byte [] regionName)};) else false.
+   * Throw an exception if <code>tableNameOrRegionName</code> is null.
+   * @throws IOException
+   */
+  private boolean isRegionName(final byte[] tableNameOrRegionName,
+      CatalogTracker ct)
+  throws IOException {
+    if (tableNameOrRegionName == null) {
+      throw new IllegalArgumentException("Pass a table name or region name");
+    }
+    return (MetaReader.getRegion(ct,
+        FSUtils.adjustTableName(tableNameOrRegionName)) != null);
+  }
+
+  /**
+   * Convert the table name byte array into a table name string and check if table
+   * exists or not.
+   * @param tableNameBytes Name of a table.
+   * @param ct A {@link #CatalogTracker} instance (caller of this method usually has one).
+   * @return tableName in string form.
+   * @throws IOException if a remote or network exception occurs.
+   * @throws TableNotFoundException if table does not exist.
+   */
+  private String tableNameString(final byte[] tableNameBytes, CatalogTracker ct)
+      throws IOException {
+    String tableNameString = Bytes.toString(tableNameBytes);
+    if (!MetaReader.tableExists(ct, tableNameString)) {
+      throw new TableNotFoundException(tableNameString);
+    }
+    return tableNameString;
   }
 
   /**
@@ -988,8 +1536,11 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public synchronized void shutdown() throws IOException {
-    if (getApacheHBaseAdmin(false) != null) {
-      getApacheHBaseAdmin().shutdown();
+    isMasterRunning();
+    try {
+      getMaster().shutdown();
+    } catch (RemoteException e) {
+      throw RemoteExceptionHandler.decodeRemoteException(e);
     }
   }
 
@@ -1000,8 +1551,11 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public synchronized void stopMaster() throws IOException {
-    if (getApacheHBaseAdmin(false) != null) {
-      getApacheHBaseAdmin().stopMaster();
+    isMasterRunning();
+    try {
+      getMaster().stopMaster();
+    } catch (RemoteException e) {
+      throw RemoteExceptionHandler.decodeRemoteException(e);
     }
   }
 
@@ -1013,9 +1567,11 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public synchronized void stopRegionServer(final String hostnamePort)
   throws IOException {
-    if (getApacheHBaseAdmin(false) != null) {
-      getApacheHBaseAdmin().stopRegionServer(hostnamePort);
-    }
+    String hostname = Addressing.parseHostname(hostnamePort);
+    int port = Addressing.parsePort(hostnamePort);
+    HRegionInterface rs =
+      this.connection.getHRegionConnection(hostname, port);
+    rs.stop("Called by admin client " + this.connection.toString());
   }
 
   /**
@@ -1023,15 +1579,20 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public ClusterStatus getClusterStatus() throws IOException {
-    return (getApacheHBaseAdmin(false) != null)
-        ? getApacheHBaseAdmin().getClusterStatus() : null;
+    return getMaster().getClusterStatus();
+  }
+
+  private HRegionLocation getFirstMetaServerForTable(final byte [] tableName)
+  throws IOException {
+    return connection.locateRegion(HConstants.META_TABLE_NAME,
+      HRegionInfo.createRegionName(tableName, null, HConstants.NINES, false));
   }
 
   /**
    * @return Configuration used by the instance.
    */
   public Configuration getConfiguration() {
-    return conf_;
+    return this.conf;
   }
 
   /**
@@ -1042,21 +1603,14 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws ZooKeeperConnectionException if unable to connect to zookeeper
    */
   public static void checkHBaseAvailable(Configuration conf)
-      throws MasterNotRunningException, ZooKeeperConnectionException {
-    //  No-op if MapR is the default engine
-    ClusterType clusterType = ClusterType.HBASE_ONLY;
+  throws MasterNotRunningException, ZooKeeperConnectionException {
+    Configuration copyOfConf = HBaseConfiguration.create(conf);
+    copyOfConf.setInt("hbase.client.retries.number", 1);
+    HBaseAdminImpl admin = new HBaseAdminImpl(copyOfConf);
     try {
-      clusterType = TableMappingRulesFactory.create(conf).getClusterType();
-    } catch (IOException e) { throw new RuntimeException(e);}
-    if (clusterType != ClusterType.MAPR_ONLY) {
-      Configuration copyOfConf = HBaseConfiguration.create(conf);
-      copyOfConf.setInt("hbase.client.retries.number", 1);
-      HBaseAdminImpl admin = new HBaseAdminImpl(copyOfConf);
-      try {
-        admin.close();
-      } catch (IOException ioe) {
-        LOG.info("Failed to close connection", ioe);
-      }
+      admin.close();
+    } catch (IOException ioe) {
+      admin.LOG.info("Failed to close connection", ioe);
     }
   }
 
@@ -1069,15 +1623,19 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public List<HRegionInfo> getTableRegions(final byte[] tableName)
   throws IOException {
-    return getAdmin(tableName).getTableRegions(tableName);
+    CatalogTracker ct = getCatalogTracker();
+    List<HRegionInfo> Regions = null;
+    try {
+      Regions = MetaReader.getTableRegions(ct, FSUtils.adjustTableName(tableName), true);
+    } finally {
+      cleanupCatalogTracker(ct);
+    }
+    return Regions;
   }
 
   public void close() throws IOException {
-    if (apacheHBaseAdmin_ != null) {
-      apacheHBaseAdmin_.close();
-    }
-    if (maprHBaseAdmin_ != null) {
-      maprHBaseAdmin_.close();
+    if (this.connection != null) {
+      this.connection.close();
     }
   }
 
@@ -1089,17 +1647,7 @@ public class HBaseAdmin implements Abortable, Closeable {
  */
   public HTableDescriptor[] getTableDescriptors(List<String> tableNames)
   throws IOException {
-    List<HTableDescriptor> list = new ArrayList<HTableDescriptor>();
-    for (String table : tableNames) {
-      byte[] tableName = Bytes.toBytes(table);
-      if (tableMappingRule_.isMapRTable(tableName)) {
-        list.add(getMaprHBaseAdmin().getTableDescriptor(tableName));
-      }
-      else {
-        list.add(getApacheHBaseAdmin().getTableDescriptor(tableName));
-      }
-    }
-    return list.toArray(new HTableDescriptor[list.size()]);
+    return this.connection.getHTableDescriptors(tableNames);
   }
 
   /**
@@ -1117,21 +1665,19 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
  public synchronized  byte[][] rollHLogWriter(String serverName)
       throws IOException, FailedLogCloseException {
-   if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().rollHLogWriter(serverName);
-   }
-   return null;
+    ServerName sn = new ServerName(serverName);
+    HRegionInterface rs = this.connection.getHRegionConnection(
+        sn.getHostname(), sn.getPort());
+    return rs.rollHLogWriter();
   }
 
   public String[] getMasterCoprocessors() {
     try {
-      if (getApacheHBaseAdmin(false) != null) {
-        return getApacheHBaseAdmin().getMasterCoprocessors();
-      }
+      return getClusterStatus().getMasterCoprocessors();
     } catch (IOException e) {
-      LOG.warn("HBaseAdmin.getMasterCoprocessors: " + e.getMessage());
+      LOG.error("Could not getClusterStatus()",e);
+      return null;
     }
-    return null;
   }
 
   /**
@@ -1159,85 +1705,66 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public CompactionState getCompactionState(final byte [] tableNameOrRegionName)
       throws IOException, InterruptedException {
-    return getAdmin(tableNameOrRegionName).getCompactionState(tableNameOrRegionName);
-  }
-
-  protected HBaseAdminInterface getMaprHBaseAdmin() {
-    if (tableMappingRule_.getClusterType() != ClusterType.HBASE_ONLY) {
-      HBaseAdminInterface admin = maprHBaseAdmin_;
-      if (admin == null) {
-        synchronized (this) {
-          admin = maprHBaseAdmin_;
-          if (admin == null) {
-            admin = maprHBaseAdmin_ = adminFactory.create(conf_,
-                TableMappingRulesInterface.MAPRFS_PREFIX);
-          }
+    CompactionState state = CompactionState.NONE;
+    final byte[] table_region_name = FSUtils.adjustTableName(tableNameOrRegionName);
+    CatalogTracker ct = getCatalogTracker();
+    try {
+      if (isRegionName(table_region_name, ct)) {
+        Pair<HRegionInfo, ServerName> pair =
+          MetaReader.getRegion(ct, table_region_name);
+        if (pair == null || pair.getSecond() == null) {
+          LOG.info("No server in .META. for " +
+            Bytes.toStringBinary(table_region_name) + "; pair=" + pair);
+        } else {
+          ServerName sn = pair.getSecond();
+          HRegionInterface rs =
+            this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+          return CompactionState.valueOf(
+            rs.getCompactionState(pair.getFirst().getRegionName()));
         }
-      }
-      return admin;
-    }
-    return null;
-  }
-
-  protected HBaseAdminInterface getAdmin(String tableName) throws IOException {
-    return (tableMappingRule_.isMapRTable(HRegionInfo.getTableName(tableName)))
-        ? getMaprHBaseAdmin()
-            : getApacheHBaseAdmin();
-  }
-
-  protected HBaseAdminInterface getAdmin(byte[] tableName) throws IOException {
-    return getAdmin(Bytes.toString(tableName));
-  }
-
-  protected HBaseAdminInterface getApacheHBaseAdmin() throws IOException {
-    return getApacheHBaseAdmin(true);
-  }
-
-  protected HBaseAdminInterface getApacheHBaseAdmin(boolean throwException)
-      throws IOException {
-    HBaseAdminInterface admin = null;
-    if (!isHbaseAvailable_) {
-      if (throwException) {
-        throw hbaseIOException_;
-      }
-    }
-    else if (tableMappingRule_.getClusterType() != ClusterType.MAPR_ONLY) {
-      if ((admin = apacheHBaseAdmin_) == null) {
-        synchronized (this) {
-          admin = apacheHBaseAdmin_;
-          if (admin == null) {
-            try {
-              admin = apacheHBaseAdmin_ = adminFactory.create(conf_,
-                  TableMappingRulesInterface.HBASE_PREFIX);
-              return admin;
+      } else {
+        final String tableName = tableNameString(table_region_name, ct);
+        List<Pair<HRegionInfo, ServerName>> pairs =
+          MetaReader.getTableRegionsAndLocations(ct, tableName);
+        for (Pair<HRegionInfo, ServerName> pair: pairs) {
+          if (pair.getFirst().isOffline()) continue;
+          if (pair.getSecond() == null) continue;
+          try {
+            ServerName sn = pair.getSecond();
+            HRegionInterface rs =
+              this.connection.getHRegionConnection(sn.getHostname(), sn.getPort());
+            switch (CompactionState.valueOf(
+              rs.getCompactionState(pair.getFirst().getRegionName()))) {
+            case MAJOR_AND_MINOR:
+              return CompactionState.MAJOR_AND_MINOR;
+            case MAJOR:
+              if (state == CompactionState.MINOR) {
+                return CompactionState.MAJOR_AND_MINOR;
+              }
+              state = CompactionState.MAJOR;
+              break;
+            case MINOR:
+              if (state == CompactionState.MAJOR) {
+                return CompactionState.MAJOR_AND_MINOR;
+              }
+              state = CompactionState.MINOR;
+              break;
+            case NONE:
+              default:
+                // nothing, continue
             }
-            catch (Throwable t) {
-              IOException ioe = null;
-              Throwable ex = t;
-              while (ex != null) {
-                if (ex instanceof IOException) {
-                  ioe = (IOException) ex;
-                  break;
-                }
-                else if (ex instanceof InvocationTargetException) {
-                  ex = ((InvocationTargetException)ex).getTargetException();
-                }
-                else {
-                  ex = ex.getCause();
-                }
-              }
-              admin = null;
-              isHbaseAvailable_ = false;
-              hbaseIOException_ = (ioe != null) ? ioe : new IOException(t);
-              LOG.warn(ex.getMessage(), ex);
-              if (throwException) {
-                throw hbaseIOException_;
-              }
+          } catch (NotServingRegionException e) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Trying to get compaction state of " +
+                pair.getFirst() + ": " +
+                StringUtils.stringifyException(e));
             }
           }
         }
       }
+    } finally {
+      cleanupCatalogTracker(ct);
     }
-    return admin;
+    return state;
   }
 }
