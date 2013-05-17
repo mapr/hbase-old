@@ -36,7 +36,7 @@
   <groupId>org.apache.hbase</groupId>
   <artifactId>hbase</artifactId>
   <packaging>jar</packaging>
-  <version>0.94.5-mapr-SNAPSHOT</version>
+  <version>0.94.5-mapr</version>
   <name>HBase</name>
   <description>
     HBase is the &amp;lt;a href="http://hadoop.apache.org"&amp;rt;Hadoop&lt;/a&amp;rt; database. Use it when you need
@@ -1003,7 +1003,7 @@
     </buildDate>
     <compileSource>1.6</compileSource>
     <apache.git.tag>0.94.5</apache.git.tag>
-    <mapr.hadoop.version>1.0.3-mapr-3.0.0-SNAPSHOT</mapr.hadoop.version>
+    <mapr.hadoop.version>1.0.3-mapr-3.0.0</mapr.hadoop.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
