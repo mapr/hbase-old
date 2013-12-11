@@ -1,0 +1,131 @@
+apply plugin: 'c'
+apply plugin: 'cpp'
+import org.apache.tools.ant.taskdefs.condition.Os
+
+model {
+    buildTypes {
+        release
+    }
+    repositories {
+        libs(PrebuiltLibraries) {
+            jvm {
+                binaries.withType(SharedLibraryBinary) {
+                    sharedLibraryFile = file("/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/server/libjvm.so")
+                }
+            }
+        }
+    }
+}
+
+ext { 
+    javaHome = System.getenv('JAVA_HOME')
+    javaHomeInclude = javaHome + '/include'
+
+    if (System.properties['os.name'].toLowerCase().contains('linux'))
+    {
+        javaHomeIncludeOs = javaHomeInclude + '/linux'
+    }
+    else
+    {
+        javaHomeIncludeOs = javaHomeInclude + '/win32'
+    }
+}
+
+
+dependencies {
+    if (! javaHome) {
+        logger.error('JAVA_HOME is not set.')
+    }
+    
+    println 'JAVA_HOME: ' + javaHome
+}
+
+
+/*
+ * libhbase-jni shared library
+ */
+libraries {
+    'libhbase-jni' {
+        binaries.withType(SharedLibraryBinary) {
+            cppCompiler.args "-ljvm", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/server", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/jamvm"
+        }
+    }
+}
+
+
+sources {
+    'libhbase-jni' {
+        cpp {
+            source {
+                srcDirs "src/jni_impl"
+                include "*.cc"
+            }
+            exportedHeaders {
+                srcDirs "include", javaHomeInclude, javaHomeIncludeOs
+                include "**/*.h"
+            }
+        }
+        c {
+            source {
+                srcDirs "src/common"
+                include "*.c"
+            }
+            exportedHeaders {
+                srcDirs "include"
+                include "*.h"
+            }
+        }
+    }
+}
+
+
+/*
+ * libhbase_test executable
+ */
+executables {
+    libhbase_test {
+        binaries.all {
+            lib libraries['libhbase-jni'].shared 
+            cCompiler.args "-ljvm", "-std=gnu99", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/server", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/jamvm"
+
+        }
+    }
+}
+
+
+sources {
+    libhbase_test {
+        c {
+            source {
+                srcDir "example"
+                include "*.c"
+            }
+
+            exportedHeaders {
+                srcDir "include"
+            } 
+
+            lib library: 'jvm'
+        }
+    }
+}
+
+
+/*
+ * Build tasks
+ */
+task wrapper(type: Wrapper) {
+  description 'A wrapper which downloads and/or uses Gradle'
+  gradleVersion = '1.12-20140220230020+0000' // using a nightly build
+}
+
+
+task 'libhbase-jni' (dependsOn: 'libhbase-jniSharedLibrary') {
+    description 'Build libhbase-jni shared library.'
+}
+
+
+task 'libhbase_test' (dependsOn: 'libhbase_testExecutable') {
+    description 'Build libhabase_test executable.'
+}
+

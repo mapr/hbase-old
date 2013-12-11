@@ -11,3 +11,6 @@
 *.iml
 *.orig
 *~
+.gradle
+gradle-wrapper.properties
+gradle-wrapper.jar
