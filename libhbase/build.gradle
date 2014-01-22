@@ -2,114 +2,129 @@ apply plugin: 'c'
 apply plugin: 'cpp'
 import org.apache.tools.ant.taskdefs.condition.Os
 
+defaultTasks "hbase", "libhbase_test"
+
+ext {
+  javaHome = System.getenv('JAVA_HOME')
+  javaHomeInclude = javaHome + '/include'
+
+  String osName = System.properties['os.name'].toLowerCase()
+  if (osName.contains('linux')) {
+    javaHomeIncludeOs = javaHomeInclude + '/linux'
+    libjvmDir = javaHome + "/jre/lib/amd64/server"
+    libjvmLibraryString = javaHome + "/jre/lib/amd64/server/libjvm.so"
+    mvnExec = "mvn"
+  }
+  else if (osName.contains('windows')) {
+    javaHomeIncludeOs = javaHomeInclude + '/win32'
+    libjvmDir = javaHome + "/lib"
+    libjvmLibraryString = javaHome + "/lib/jvm.lib"
+    mvnExec = "mvn.bat"
+  }
+  else if (osName.contains('mac os x')) {
+    // TODO - deal with different versions of OSX, because Apple has done heavy modification to the JVM and JDK every version
+    javaHomeInclude = "/System/Library/Frameworks/JavaVM.framework/Versions/A/Headers"
+    javaHomeIncludeOs = "/System/Library/Frameworks/JavaVM.framework/Versions/A/Headers"
+    libjvmDir = "/System/Library/Java/JavaVirtualMachines/1.6.0.jdk/Contents/Libraries"
+    libjvmLibraryString = "/System/Library/Java/JavaVirtualMachines/1.6.0.jdk/Contents/Libraries/libserver.dylib"
+    mvnExec = "mvn"
+  }
+}
+
+File libjvmLibraryFile = file(libjvmLibraryString)
+if (!libjvmLibraryFile.exists()) {
+  logger.error("The file ${libjvmLibraryString} was not found")
+  throw new GradleException("The file ${libjvmLibraryString} was not found")
+} else {
+  logger.info("Using ${libjvmLibraryString} and include directories ${javaHomeInclude} and ${javaHomeIncludeOs}")
+}
+
 model {
-    buildTypes {
-        release
-    }
-    repositories {
-        libs(PrebuiltLibraries) {
-            jvm {
-                binaries.withType(SharedLibraryBinary) {
-                    sharedLibraryFile = file("/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/server/libjvm.so")
-                }
-            }
+  buildTypes {
+    release
+  }
+  repositories {
+    libs(PrebuiltLibraries) {
+      jvm {
+        binaries.withType(SharedLibraryBinary) {
+          sharedLibraryFile = libjvmLibraryFile
         }
+      }
     }
+  }
 }
-
-ext { 
-    javaHome = System.getenv('JAVA_HOME')
-    javaHomeInclude = javaHome + '/include'
-
-    if (System.properties['os.name'].toLowerCase().contains('linux'))
-    {
-        javaHomeIncludeOs = javaHomeInclude + '/linux'
-    }
-    else
-    {
-        javaHomeIncludeOs = javaHomeInclude + '/win32'
-    }
-}
-
 
 dependencies {
-    if (! javaHome) {
-        logger.error('JAVA_HOME is not set.')
-    }
-    
-    println 'JAVA_HOME: ' + javaHome
+  if (!javaHome) {
+    logger.error('JAVA_HOME is not set.')
+    throw new GradleException("JAVA_HOME is not set.")
+  }
+  println 'Found JAVA_HOME: ' + javaHome
 }
-
-
-/*
- * libhbase-jni shared library
- */
-libraries {
-    'libhbase-jni' {
-        binaries.withType(SharedLibraryBinary) {
-            cppCompiler.args "-ljvm", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/server", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/jamvm"
-        }
-    }
-}
-
 
 sources {
-    'libhbase-jni' {
-        cpp {
-            source {
-                srcDirs "src/jni_impl"
-                include "*.cc"
-            }
-            exportedHeaders {
-                srcDirs "include", javaHomeInclude, javaHomeIncludeOs
-                include "**/*.h"
-            }
-        }
-        c {
-            source {
-                srcDirs "src/common"
-                include "*.c"
-            }
-            exportedHeaders {
-                srcDirs "include"
-                include "*.h"
-            }
-        }
+  'hbase' {
+    cpp {
+      source {
+        srcDirs "src/native/jni_impl"
+        include "*.cc"
+      }
+      exportedHeaders {
+        srcDirs "include", javaHomeInclude, javaHomeIncludeOs, "jnibridgeheaders"
+      }
     }
+    c {
+      source {
+        srcDirs "src/native/common"
+        include "*.c"
+      }
+      exportedHeaders {
+        srcDirs "include"
+      }
+    }
+  }
+  libhbase_test {
+    c {
+      source {
+        srcDir "example"
+        include "*.c"
+      }
+      exportedHeaders {
+        srcDir "include"
+      }
+
+      lib library: 'jvm'
+    }
+  }
 }
 
+/*
+ * libHBase Shared Library
+ */
+libraries {
+  'hbase' {
+    binaries.withType(SharedLibraryBinary) {
+      cppCompiler.args "-ljvm", "-L${libjvmDir}", "-Wall", "-Werror", "-fvisibility=hidden", "-fvisibility-inlines-hidden"
+      cppCompiler.define "_LIBHBASE_IMPLEMENTATION_"
+      cppCompiler.define "THREADED"
+      cCompiler.args "-Wall", "-Werror", "-fvisibility=hidden"
+      cCompiler.define "_LIBHBASE_IMPLEMENTATION_"
+      cCompiler.define "THREADED"
+    }
+  }
+}
 
 /*
  * libhbase_test executable
  */
 executables {
-    libhbase_test {
-        binaries.all {
-            lib libraries['libhbase-jni'].shared 
-            cCompiler.args "-ljvm", "-std=gnu99", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/server", "-L/usr/lib/jvm/java-7-openjdk-amd64/jre/lib/amd64/jamvm"
-
-        }
+  libhbase_test {
+    binaries.all {
+      lib libraries.'hbase'.shared
+      cCompiler.args "-ljvm", "-std=gnu99", "-L${libjvmDir}"
     }
+  }
 }
-
-
-sources {
-    libhbase_test {
-        c {
-            source {
-                srcDir "example"
-                include "*.c"
-            }
-
-            exportedHeaders {
-                srcDir "include"
-            } 
-
-            lib library: 'jvm'
-        }
-    }
-}
-
 
 /*
  * Build tasks
@@ -119,13 +134,10 @@ task wrapper(type: Wrapper) {
   gradleVersion = '1.12-20140220230020+0000' // using a nightly build
 }
 
-
-task 'libhbase-jni' (dependsOn: 'libhbase-jniSharedLibrary') {
-    description 'Build libhbase-jni shared library.'
+task 'hbase' (dependsOn: 'hbaseSharedLibrary') {
+  description 'Build HBase shared library.'
 }
-
 
 task 'libhbase_test' (dependsOn: 'libhbase_testExecutable') {
-    description 'Build libhabase_test executable.'
+  description 'Build libhabase_test executable.'
 }
-
