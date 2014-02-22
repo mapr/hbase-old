@@ -1,59 +1,79 @@
+import org.gradle.internal.os.OperatingSystem
+
 apply plugin: 'c'
 apply plugin: 'cpp'
-import org.apache.tools.ant.taskdefs.condition.Os
 
-defaultTasks "hbase", "libhbase_test"
+defaultTasks "hbase", "perftest", "example_async"
 
 ext {
-  javaHome = System.getenv('JAVA_HOME')
+  currentJvm = org.gradle.internal.jvm.Jvm.current()
+  javaHome = currentJvm.getJavaHome().getAbsolutePath()
   javaHomeInclude = javaHome + '/include'
 
   String osName = System.properties['os.name'].toLowerCase()
   if (osName.contains('linux')) {
     javaHomeIncludeOs = javaHomeInclude + '/linux'
-    libjvmDir = javaHome + "/jre/lib/amd64/server"
     libjvmLibraryString = javaHome + "/jre/lib/amd64/server/libjvm.so"
-    mvnExec = "mvn"
   }
   else if (osName.contains('windows')) {
     javaHomeIncludeOs = javaHomeInclude + '/win32'
-    libjvmDir = javaHome + "/lib"
     libjvmLibraryString = javaHome + "/lib/jvm.lib"
-    mvnExec = "mvn.bat"
   }
   else if (osName.contains('mac os x')) {
-    // TODO - deal with different versions of OSX, because Apple has done heavy modification to the JVM and JDK every version
+    // TODO - deal with different versions of OSX,
+    // because Apple has done heavy modification to the JVM and JDK every version
     javaHomeInclude = "/System/Library/Frameworks/JavaVM.framework/Versions/A/Headers"
     javaHomeIncludeOs = "/System/Library/Frameworks/JavaVM.framework/Versions/A/Headers"
-    libjvmDir = "/System/Library/Java/JavaVirtualMachines/1.6.0.jdk/Contents/Libraries"
     libjvmLibraryString = "/System/Library/Java/JavaVirtualMachines/1.6.0.jdk/Contents/Libraries/libserver.dylib"
-    mvnExec = "mvn"
+  }
+
+  // this should be set to the directory of JNI generated headers
+  if (!project.hasProperty('jniIncludeDir')) {
+    jniIncludeDir = "src/main/native/generated"
   }
 }
 
-File libjvmLibraryFile = file(libjvmLibraryString)
-if (!libjvmLibraryFile.exists()) {
-  logger.error("The file ${libjvmLibraryString} was not found")
-  throw new GradleException("The file ${libjvmLibraryString} was not found")
-} else {
-  logger.info("Using ${libjvmLibraryString} and include directories ${javaHomeInclude} and ${javaHomeIncludeOs}")
+def stdout = new ByteArrayOutputStream()
+try {
+  exec {
+    commandLine(
+        "ls", libjvmLibraryString
+        )
+    errorOutput = stdout
+    standardOutput = stdout
+    ignoreExitValue = false
+    logger.info("Using ${libjvmLibraryString} and include directories ${javaHomeInclude} and ${javaHomeIncludeOs}")
+  }
+} catch(e){
+    logger.error(stdout.toString())
+    throw new GradleException("The file ${libjvmLibraryString} was not found")
 }
 
 model {
+  toolChains {
+    // currently only GCC is supported
+    gcc(Gcc) {
+    }
+  }
+
   buildTypes {
     release
   }
+  
   repositories {
     libs(PrebuiltLibraries) {
       jvm {
         binaries.withType(SharedLibraryBinary) {
-          sharedLibraryFile = libjvmLibraryFile
+          sharedLibraryFile = file(libjvmLibraryString)
         }
       }
     }
   }
 }
 
+/**
+ * Verify that JAVA_HOME is set
+ */
 dependencies {
   if (!javaHome) {
     logger.error('JAVA_HOME is not set.')
@@ -62,52 +82,87 @@ dependencies {
   println 'Found JAVA_HOME: ' + javaHome
 }
 
+/**
+ * Register the source files for goals
+ */
 sources {
-  'hbase' {
+  /* libHBase sources */
+  hbase {
     cpp {
       source {
-        srcDirs "src/native/jni_impl"
-        include "*.cc"
+        srcDirs "src/main/native/jni_impl", "src/main/native/common"
+        include "**/*.cc"
       }
       exportedHeaders {
-        srcDirs "include", javaHomeInclude, javaHomeIncludeOs, "jnibridgeheaders"
-      }
-    }
-    c {
-      source {
-        srcDirs "src/native/common"
-        include "*.c"
-      }
-      exportedHeaders {
-        srcDirs "include"
+        srcDirs "include", "src/main/native/common", jniIncludeDir,
+                javaHomeInclude, javaHomeIncludeOs
       }
     }
   }
-  libhbase_test {
-    c {
-      source {
-        srcDir "example"
-        include "*.c"
-      }
-      exportedHeaders {
-        srcDir "include"
-      }
 
-      lib library: 'jvm'
+  /* perftest sources */
+  perftest {
+    cpp {
+      source {
+        srcDirs "src/test/native/perftest", "src/test/native/common"
+        include "**/*.cc"
+      }
+      exportedHeaders {
+        srcDirs "src/test/native/common"
+      }
     }
   }
+
+  /* example_async sources */
+  example_async {
+    cpp {
+      source {
+        srcDirs "src/test/native/common"
+        include "**/*.cc"
+      }
+      exportedHeaders {
+        srcDirs "src/test/native/common"
+      }
+    }
+    c {
+      source {
+        srcDirs "example/async"
+        include "*.c"
+      }
+      exportedHeaders {
+        srcDirs "src/test/native/common"
+      }
+    }
+  }
+}
+
+/**
+ * Compiler flags for all targets
+ */
+binaries.all {
+  if (toolChain in Gcc) {
+    cCompiler.args "-Wall", "-Werror", "-fvisibility=hidden", "-std=gnu99"
+    cppCompiler.args "-Wall", "-Werror", "-fvisibility=hidden", "-fvisibility-inlines-hidden"
+
+    lib library: 'jvm', linkage: 'shared'
+    if (OperatingSystem.current().windows) {
+      // Without this, the linker decorate the JNIEXPORTs and then JNI can not find them
+      linker.args "-Wl,--kill-at"
+    }
+  }
+  // TODO: set flags for other compilers
 }
 
 /*
  * libHBase Shared Library
  */
 libraries {
-  'hbase' {
+  hbase {
     binaries.withType(SharedLibraryBinary) {
-      cppCompiler.args "-ljvm", "-L${libjvmDir}", "-Wall", "-Werror", "-fvisibility=hidden", "-fvisibility-inlines-hidden"
+      cppCompiler.define "__STDC_FORMAT_MACROS"       // for PRIu64 macro
       cppCompiler.define "_LIBHBASE_IMPLEMENTATION_"
       cppCompiler.define "THREADED"
-      cCompiler.args "-Wall", "-Werror", "-fvisibility=hidden"
+
       cCompiler.define "_LIBHBASE_IMPLEMENTATION_"
       cCompiler.define "THREADED"
     }
@@ -115,13 +170,20 @@ libraries {
 }
 
 /*
- * libhbase_test executable
+ * example_async executable
  */
 executables {
-  libhbase_test {
+  perftest {
     binaries.all {
-      lib libraries.'hbase'.shared
-      cCompiler.args "-ljvm", "-std=gnu99", "-L${libjvmDir}"
+      cppCompiler.define "__STDC_FORMAT_MACROS" // for PRIu64 macro
+
+      lib library: 'hbase', linkage: 'shared'
+    }
+  }
+
+  example_async {
+    binaries.all {
+      lib library: 'hbase', linkage: 'shared'
     }
   }
 }
@@ -135,9 +197,13 @@ task wrapper(type: Wrapper) {
 }
 
 task 'hbase' (dependsOn: 'hbaseSharedLibrary') {
-  description 'Build HBase shared library.'
+  description 'Builds HBase shared library.'
 }
 
-task 'libhbase_test' (dependsOn: 'libhbase_testExecutable') {
-  description 'Build libhabase_test executable.'
+task 'perftest' (dependsOn: 'perftestExecutable') {
+  description 'Builds perftest executable.'
+}
+
+task 'example_async' (dependsOn: 'example_asyncExecutable') {
+  description 'Builds async example executable.'
 }
