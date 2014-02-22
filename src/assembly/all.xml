@@ -56,6 +56,18 @@
       <directoryMode>0755</directoryMode>
     </fileSet>
     <fileSet>
+      <directory>libhbase/include</directory>
+      <outputDirectory>src/include</outputDirectory>
+      <fileMode>0644</fileMode>
+      <directoryMode>0755</directoryMode>
+    </fileSet>
+    <fileSet>
+      <directory>libhbase/example</directory>
+      <outputDirectory>src/examples/libhbase</outputDirectory>
+      <fileMode>0644</fileMode>
+      <directoryMode>0755</directoryMode>
+    </fileSet>
+    <fileSet>
       <directory>target</directory>
       <outputDirectory>/</outputDirectory>
       <includes>
@@ -109,7 +121,6 @@
         <exclude>org.eclipse.jdt:core</exclude>
         <exclude>com.mapr.hadoop:maprfs</exclude>
         <exclude>com.mapr.util:central-logging</exclude>
-        <exclude>com.google.protobuf:protobuf-java</exclude>
       </excludes>
       <fileMode>0644</fileMode>
       <directoryMode>0644</directoryMode>
