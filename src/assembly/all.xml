@@ -66,6 +66,24 @@
       <directoryMode>0755</directoryMode>
     </fileSet>
     <fileSet>
+      <directory>libhbase/src</directory>
+      <outputDirectory>src/libhbase</outputDirectory>
+      <fileMode>0644</fileMode>
+      <directoryMode>0755</directoryMode>
+    </fileSet>
+    <fileSet>
+      <directory>libhbase/include</directory>
+      <outputDirectory>src/include</outputDirectory>
+      <fileMode>0644</fileMode>
+      <directoryMode>0755</directoryMode>
+    </fileSet>
+    <fileSet>
+      <directory>libhbase/example</directory>
+      <outputDirectory>src/examples/libhbase</outputDirectory>
+      <fileMode>0644</fileMode>
+      <directoryMode>0755</directoryMode>
+    </fileSet>
+    <fileSet>
       <directory>target</directory>
       <outputDirectory>/</outputDirectory>
       <includes>

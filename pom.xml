@@ -36,7 +36,7 @@
   <groupId>org.apache.hbase</groupId>
   <artifactId>hbase</artifactId>
   <packaging>jar</packaging>
-  <version>0.94.17</version>
+  <version>0.94.17-libhbase-SNAPSHOT</version>
   <name>HBase</name>
   <description>
     HBase is the &amp;lt;a href="http://hadoop.apache.org"&amp;rt;Hadoop&lt;/a&amp;rt; database. Use it when you need
@@ -295,6 +295,18 @@
       <id>ghelmling.testing</id>
       <name>Gary Helmling test repo</name>
       <url>http://people.apache.org/~garyh/mvn/</url>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+    </repository>
+    <repository>
+      <!-- added for the dev version of AsyncHBase artifact -->
+      <id>mapr-public</id>
+      <name>MapR Public Maven Repository</name>
+      <url>http://repository.mapr.com/maven/</url>
       <snapshots>
         <enabled>true</enabled>
       </snapshots>
@@ -905,8 +917,15 @@
 					else
 						BUILD_DIR=`cygpath --unix '${project.build.directory}'`
 					fi
+                    PLATFORM_NATIVE_DIR=$BUILD_DIR/${project.build.finalName}/${project.build.finalName}/lib/native/${build.platform}/
                     if [ `ls $BUILD_DIR/nativelib | wc -l` -ne 0 ]; then
-                      cp -PR $BUILD_DIR/nativelib/lib* $BUILD_DIR/${project.build.finalName}/${project.build.finalName}/lib/native/${build.platform}
+                      cp -PR $BUILD_DIR/nativelib/lib* $PLATFORM_NATIVE_DIR
+                    fi
+                    if [ `ls $BUILD_DIR/gradle/binaries/hbaseSharedLibrary | wc -l` -ne 0 ]; then
+                      cp -PR $BUILD_DIR/gradle/binaries/hbaseSharedLibrary/*hbase* $PLATFORM_NATIVE_DIR
+                    fi
+                    if [ `ls $BUILD_DIR/gradle/binaries/perftestExecutable | wc -l` -ne 0 ]; then
+                      cp -PR $BUILD_DIR/gradle/binaries/perftestExecutable/perf* $PLATFORM_NATIVE_DIR
                     fi
                 </echo>
                 <exec executable="sh" dir="${project.build.directory}" failonerror="true">
@@ -1011,6 +1030,8 @@
     </buildDate>
     <compileSource>1.6</compileSource>
 
+    <skip.gradle.exec>true</skip.gradle.exec>
+
     <!-- Dependencies -->
     <avro.version>1.5.3</avro.version>
     <commons-cli.version>1.2</commons-cli.version>
@@ -1034,7 +1055,7 @@
     <slf4j.version>1.4.3</slf4j.version>
     <log4j.version>1.2.16</log4j.version>
     <mockito-all.version>1.8.5</mockito-all.version>
-    <protobuf.version>2.4.0a</protobuf.version>
+    <protobuf.version>2.5.0</protobuf.version>
     <stax-api.version>1.0.1</stax-api.version>
     <thrift.version>0.8.0</thrift.version>
     <zookeeper.version>3.4.5</zookeeper.version>
@@ -1478,6 +1499,7 @@
         </os>
       </activation>
       <properties>
+        <skip.gradle.exec>false</skip.gradle.exec>
         <build.platform>${os.name}-${os.arch}-${sun.arch.data.model}</build.platform>
       </properties>
     </profile>
@@ -1663,6 +1685,110 @@
           </plugin>
         </plugins>
       </build>
+    </profile>
+
+    <!-- profile for building with libhbase -->
+    <profile>
+      <id>libhbase</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>add-libhbase-source</id>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/libhbase/src/main/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+              <execution>
+                <id>add-libhbase-test-source</id>
+                <goals>
+                  <goal>add-test-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>${project.basedir}/libhbase/src/test/java</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>native-maven-plugin</artifactId>
+            <version>1.0-alpha-7</version>
+            <extensions>true</extensions>
+            <executions>
+              <execution>
+                <id>generate-jni-headers</id>
+                <phase>compile</phase>
+                <goals>
+                  <goal>javah</goal>
+                </goals>
+                <configuration>
+                  <javahClassNames>
+                    <javahClassName>org.apache.hadoop.hbase.jni.CallbackHandlers</javahClassName>
+                  </javahClassNames>
+                  <javahOutputDirectory>${project.build.directory}/native/javah</javahOutputDirectory>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>exec-maven-plugin</artifactId>
+            <version>1.2.1</version>
+            <executions>
+              <execution>
+                <id>build-libhbase-binaries</id>
+                <phase>compile</phase>
+                <goals>
+                  <goal>exec</goal>
+                </goals>
+                <configuration>
+                  <skip>${skip.gradle.exec}</skip>
+                  <executable>bash</executable>
+                  <workingDirectory>${basedir}/libhbase</workingDirectory>
+                  <arguments>
+                    <argument>gradlew</argument>
+                    <argument>hbase</argument>
+                    <argument>perftest</argument>
+                    <argument>-PbuildDir=${project.build.directory}/gradle</argument>
+                    <argument>-PjniIncludeDir=${project.build.directory}/native/javah</argument>
+                  </arguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+
+      <dependencies>
+        <dependency>
+          <groupId>org.hbase</groupId>
+          <artifactId>asynchbase</artifactId>
+          <version>1.5.0-libhbase-SNAPSHOT</version>
+          <exclusions>
+            <exclusion>
+              <groupId>org.slf4j</groupId>
+              <artifactId>log4j-over-slf4j</artifactId>
+            </exclusion>
+          </exclusions>
+        </dependency>
+      </dependencies>
     </profile>
 
     <!-- profile for building against Hadoop 0.20+security-->
