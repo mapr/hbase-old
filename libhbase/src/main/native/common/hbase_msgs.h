@@ -37,8 +37,17 @@ public:
   static const char *ERR_TBL_LEN;
   static const char *ERR_TBL_NAME_NULL;
 
+  static const char *ERR_START_ROW_NULL;
+  static const char *ERR_START_ROWL_LEN;
+
+  static const char *ERR_END_ROW_NULL;
+  static const char *ERR_END_ROWL_LEN;
+
   static const char *ERR_TBLPTR_NULL;
   static const char *ERR_TBL_LENPTR_NULL;
+
+  static const char *ERR_KEYPTR_NULL;
+  static const char *ERR_KEY_LENPTR;
 
   static const char *ERR_HTBL_NULL;
   static const char *ERR_HTBLPTR_NULL;
@@ -94,6 +103,11 @@ public:
 
   static const char *ERR_TABLE_ALREADY_DISABLED;
   static const char *ERR_TABLE_ALREADY_ENABLED;
+
+  static const char *ERR_SCANNER_NULL;
+  static const char *ERR_SCANNERPTR_NULL;
+  static const char *ERR_CACHE_SIZE;
+  static const char *ERR_SCANNER_OPEN;
 };
 
 } // namespace hbase

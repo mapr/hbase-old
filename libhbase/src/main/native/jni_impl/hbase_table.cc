@@ -19,7 +19,6 @@
 #include <errno.h>
 
 #include <hbase/sync/hbase.h>
-#include <hbase/async/hbase.h>
 
 #include "hbase_table.h"
 

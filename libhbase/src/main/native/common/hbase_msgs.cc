@@ -50,6 +50,14 @@ const char *Msgs::ERR_TBL_NULL = "'table' is NULL.";
 
 const char *Msgs::ERR_TBL_LEN = "'table_len' %d is <= 0.";
 
+const char *Msgs::ERR_START_ROW_NULL = "'start_row' is NULL.";
+
+const char *Msgs::ERR_START_ROWL_LEN = "'start_row_len' %d is <= 0.";
+
+const char *Msgs::ERR_END_ROW_NULL = "'end_row' is NULL.";
+
+const char *Msgs::ERR_END_ROWL_LEN = "'end_row_len' %d is <= 0.";
+
 const char *Msgs::ERR_FAMILIES_NULL = "'families[]' is NULL.";
 
 const char *Msgs::ERR_FAMILY_NULL = "'family' is NULL.";
@@ -75,6 +83,10 @@ const char *Msgs::ERR_CELL_COUNTPTR_NULL = "'cell_count_ptr' is NULL.";
 const char *Msgs::ERR_KEY_NULL = "'rowkey' is NULL.";
 
 const char *Msgs::ERR_KEY_LEN = "'rowkey_len' %d is <= 0.";
+
+const char *Msgs::ERR_KEYPTR_NULL = "'key_ptr' is NULL.";
+
+const char *Msgs::ERR_KEY_LENPTR = "'key_length_ptr' is NULL.";
 
 const char *Msgs::ERR_QUAL_NULL = "'qualifier' is NULL.";
 
@@ -123,5 +135,13 @@ const char *Msgs::ERR_TABLE_ALREADY_DISABLED =
 
 const char *Msgs::ERR_TABLE_ALREADY_ENABLED =
     "EnableTable() called for '%s' which is already enabled.";
+
+const char *Msgs::ERR_SCANNER_NULL = "'hb_scanner_t' is NULL.";
+
+const char *Msgs::ERR_SCANNERPTR_NULL = "'hb_scanner_t*' is NULL.";
+
+const char *Msgs::ERR_CACHE_SIZE = "'cache_size' %d is <= 0.";
+
+const char *Msgs::ERR_SCANNER_OPEN = "Scanner is already open.";
 
 } // namespace hbase

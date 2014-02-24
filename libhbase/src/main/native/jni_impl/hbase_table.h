@@ -18,8 +18,6 @@
 #ifndef HBASE_JNI_IMPL_HTABLE_H__
 #define HBASE_JNI_IMPL_HTABLE_H__
 
-#include <string>
-
 #include "hbase_config.h"
 #include "hbase_mutations.h"
 #include "hbase_put.h"

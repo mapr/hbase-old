@@ -39,6 +39,22 @@ JNIEXPORT void JNICALL Java_org_apache_hadoop_hbase_jni_CallbackHandlers_clientF
 JNIEXPORT void JNICALL Java_org_apache_hadoop_hbase_jni_CallbackHandlers_clientCloseCallBack
   (JNIEnv *, jclass, jthrowable, jlong, jlong, jlong);
 
+/*
+ * Class:     org_apache_hadoop_hbase_jni_CallbackHandlers
+ * Method:    scannerCloseCallBack
+ * Signature: (Ljava/lang/Throwable;JJJ)V
+ */
+JNIEXPORT void JNICALL Java_org_apache_hadoop_hbase_jni_CallbackHandlers_scannerCloseCallBack
+  (JNIEnv *, jclass, jthrowable, jlong, jlong, jlong);
+
+/*
+ * Class:     org_apache_hadoop_hbase_jni_CallbackHandlers
+ * Method:    scanNextCallBack
+ * Signature: (Ljava/lang/Throwable;JJ[Ljava/lang/Object;IJ)V
+ */
+JNIEXPORT void JNICALL Java_org_apache_hadoop_hbase_jni_CallbackHandlers_scanNextCallBack
+  (JNIEnv *, jclass, jthrowable, jlong, jlong, jobjectArray, jint, jlong);
+
 #ifdef __cplusplus
 }
 #endif

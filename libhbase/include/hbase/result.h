@@ -27,74 +27,91 @@ extern "C" {
 #include "types.h"
 
 /**
- * Returns a pointer and length specifying the table name associated with the
- * hb_result_t object. This buffer is valid until hb_result_free() is called.
- * Caller should not modify this buffer
+ * Returns the row key of this hb_result_t object.
+ * This buffer is valid until hb_result_destroy() is called.
+ * Callers should not modify this buffer.
  */
 HBASE_API int32_t
-hb_result_get_table(const hb_result_t result,
-    char **table, size_t *table_length);
+hb_result_get_key(
+    const hb_result_t result, /* [in] */
+    const byte_t **key_ptr,   /* [out] */
+    size_t *key_length_ptr);  /* [out] */
 
 /**
- * @NotYetImplemented
+ * Returns the table name of this hb_result_t object.
+ * This buffer is valid until hb_result_destroy() is called.
+ * Callers should not modify this buffer.
+ */
+HBASE_API int32_t
+hb_result_get_table(
+    const hb_result_t result,  /* [in] */
+    const char **table_ptr,    /* [out] */
+    size_t *table_length_ptr); /* [out] */
+
+/**
+ * HBase 0.96 or later.
+ * Returns the namespace of this hb_result_t object.
+ * This buffer is valid until hb_result_destroy() is called.
+ * Callers should not modify this buffer.
+ */
+HBASE_API int32_t
+hb_result_get_namespace(
+    const hb_result_t result,      /* [in] */
+    const char **namespace_ptr,    /* [out] */
+    size_t *namespace_length_ptr); /* [out] */
+
+/**
+ * Returns the total number of cells in this hb_result_t object.
+ */
+HBASE_API int32_t
+hb_result_get_cell_count(
+    const hb_result_t result, /* [in] */
+    size_t *cell_count_ptr);  /* [out] */
+
+/**
+ * Returns the pointer to a constant hb_cell_t structure with the most recent
+ * value of the given column. The buffers are valid until hb_result_destroy()
+ * is called. Callers should not modify these buffers.
  *
- * HBase 0.96 or later: Returns a pointer and length specifying the name space
- * associated with the hb_result_t object. This buffer is valid until
- * hb_result_free() is called.
- * Caller should not modify this buffer
+ * @returns 0       if operation succeeds.
+ * @returns ENOENT  if a matching cell is not found.
  */
 HBASE_API int32_t
-hb_result_get_namespace(const hb_result_t result,
-    char **name_space, size_t *name_space_length);
+hb_result_get_cell(
+    const hb_result_t result,    /* [in] */
+    const byte_t *family,        /* [in] */
+    const size_t family_len,     /* [in] */
+    const byte_t *qualifier,     /* [in] */
+    const size_t qualifier_len,  /* [in] */
+    const hb_cell_t **cell_ptr); /* [out] */
 
 /**
- * Populates the provided hb_cell_t structure with the most recent value of the
- * given column. The buffers pointed by hb_cell_t structure can be freed by
- * calling hb_cell_free().
+ * Returns the pointer to a constant hb_cell_t structure containing the cell
+ * value at the given 0 based index of the result. The buffers are valid until
+ * hb_result_destroy() is called. Callers should not modify these buffers.
  *
- * @returns 0 if operation succeeds
- * @returns ENOENT if a matching cell is not found
+ * @returns 0       if operation succeeds.
+ * @returns ERANGE  if the index is outside the bounds.
  */
 HBASE_API int32_t
-hb_result_get_cell(const hb_result_t result,
-    const byte_t *family, const size_t family_len,
-    const byte_t *qualifier, const size_t qualifier_len,
-    hb_cell_t *cell_ptr);
+hb_result_get_cell_at(
+    const hb_result_t result,    /* [in] */
+    const size_t index,          /* [in] */
+    const hb_cell_t **cell_ptr); /* [out] */
 
 /**
- * Returns the total number of cells in the hb_result_t object.
- */
-HBASE_API int32_t
-hb_result_get_cell_count(const hb_result_t result, size_t *cell_count);
-
-/**
- * Populates the provided hb_cell_t structure with the cell value at the given 0
- * based index of the result. The buffers pointed by hb_cell_t structures can be
- * freed by calling hb_cell_free().
- */
-HBASE_API int32_t
-hb_result_get_cell_at(const hb_result_t result,
-    const size_t index, hb_cell_t *cell_ptr);
-
-/**
- * Populates the provided array of hb_cell_t structures with the cell values
- * of the result. The buffers pointed by hb_cell_t structures can be freed
- * by calling hb_result_destroy().
+ * Returns the array of pointers to constant hb_cell_t structures with the cells
+ * of the result. The buffers are valid until hb_result_destroy() is called. The
+ * variable pointed by num_cells_ptr is set to the number of cells in the result.
+ *
  * Calling this function multiple times for the same hb_result_t may return
- * the same buffers.
+ * the same buffers. Callers should not modify these buffers.
  */
 HBASE_API int32_t
-hb_result_get_cells(const hb_result_t result,
-    hb_cell_t *cell_ptr[], size_t *num_cells);
-
-/**
- * Frees the library allocated buffers associated with the cell. All pointers
- * of hb_cell_t object becomes invalid after this call. Application should only
- * call this function with the cells extracted from the hb_result_t object.
- * The memory occupied by the structure itself if not freed.
- */
-HBASE_API int32_t
-hb_cell_free(hb_cell_t *cell_ptr);
+hb_result_get_cells(
+    const hb_result_t result,     /* [in] */
+    const hb_cell_t ***cells_ptr, /* [out] */
+    size_t *num_cells_ptr);       /* [out] */
 
 /**
  * Frees any resources held by the hb_result_t object.

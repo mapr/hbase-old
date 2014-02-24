@@ -47,4 +47,10 @@ public class CallbackHandlers {
 
   public static native void clientCloseCallBack(Throwable t,
       long callback, long client, long extra);
+
+  public static native void scannerCloseCallBack(Throwable t,
+      long callback, long scanner, long extra);
+
+  public static native void scanNextCallBack(Throwable t,
+      long callback, long scanner, Object[] results, int numResults, long extra);
 }

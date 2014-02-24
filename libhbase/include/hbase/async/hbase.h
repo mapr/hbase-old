@@ -93,8 +93,6 @@ hb_get_send(
     void *extra);
 
 /**
- * @NotYetImplemented
- *
  * Request the next set of results from the server. You can set the maximum
  * number of rows returned by this call using hb_scanner_set_num_max_rows().
  */
@@ -102,18 +100,6 @@ HBASE_API int32_t
 hb_scanner_next(
     hb_scanner_t scanner,
     hb_scanner_cb cb,
-    void *extra);
-
-/**
- * @NotYetImplemented
- *
- * Close the scanner releasing any local and server side resources held.
- * The call back is fired just before the scanner's memory is freed.
- */
-HBASE_API int32_t
-hb_scanner_destroy(
-    hb_scanner_t scanner,
-    hb_scanner_destroy_cb cb,
     void *extra);
 
 #ifdef __cplusplus

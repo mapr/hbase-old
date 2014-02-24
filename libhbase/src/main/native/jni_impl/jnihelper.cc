@@ -809,6 +809,7 @@ JniHelper::CreateByteArray(
     *bufLen = (size_t) env->GetArrayLength(javaByteArray);
     *bufPtr = new byte_t[*bufLen];
     if (*bufPtr == NULL) {
+      *bufLen = 0;
       return Status::ENoMem;
     }
     env->GetByteArrayRegion(javaByteArray, 0, *bufLen, (jbyte*)*bufPtr);

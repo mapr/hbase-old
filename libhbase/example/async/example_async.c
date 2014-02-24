@@ -143,6 +143,25 @@ wait_for_flush() {
   HBASE_LOG_INFO("Flush completed.");
 }
 
+static void printRow(const hb_result_t result) {
+  const byte_t *key = NULL;
+  size_t key_len = 0;
+  hb_result_get_key(result, &key, &key_len);
+  size_t cell_count = 0;
+  hb_result_get_cell_count(result, &cell_count);
+  HBASE_LOG_INFO("Row=\'%.*s\', cell count=%d", key_len, key, cell_count);
+  const hb_cell_t **cells;
+  hb_result_get_cells(result, &cells, &cell_count);
+  for (size_t i = 0; i < cell_count; ++i) {
+    HBASE_LOG_INFO(
+        "Cell %d: family=\'%.*s\', qualifier=\'%.*s\', "
+        "value=\'%.*s\', timestamp=%lld.", i,
+        cells[i]->family_len, cells[i]->family,
+        cells[i]->qualifier_len, cells[i]->qualifier,
+        cells[i]->value_len, cells[i]->value, cells[i]->ts);
+  }
+}
+
 /**
  * Get synchronizer and callback
  */
@@ -155,36 +174,22 @@ get_callback(int32_t err, hb_client_t client,
     hb_get_t get, hb_result_t result, void *extra) {
   bytebuffer rowKey = (bytebuffer)extra;
   if (err == 0) {
-    char *table_name;
+    const char *table_name;
     size_t table_name_len;
-    size_t cell_count;
-    hb_result_get_cell_count(result, &cell_count);
     hb_result_get_table(result, &table_name, &table_name_len);
-    HBASE_LOG_INFO(
-        "Received get callback for table=\'%.*s\', "
-        "row=\'%.*s\', cell count=%d",
-        table_name_len, table_name,
-        rowKey->length, rowKey->buffer,cell_count);
-    hb_cell_t *cells;
-    hb_result_get_cells(result, &cells, &cell_count);
-    for (size_t i = 0; i < cell_count; ++i) {
-      HBASE_LOG_INFO(
-          "Cell %d: family=\'%.*s\', qualifier=\'%.*s\', "
-          "value=\'%.*s\', timestamp=%lld.", i,
-          cells[i].family_len, cells[i].family,
-          cells[i].qualifier_len, cells[i].qualifier,
-          cells[i].value_len, cells[i].value, cells[i].ts);
-    }
+    HBASE_LOG_INFO("Received get callback for table=\'%.*s\'.",
+        table_name_len, table_name);
 
-    hb_cell_t mycell;
+    printRow(result);
+
+    const hb_cell_t *mycell;
     bytebuffer qualifier = bytebuffer_strcpy("column-a");
     HBASE_LOG_INFO("Looking up cell for family=\'%s\', qualifier=\'%.*s\'.",
         FAMILIES[0], qualifier->length, qualifier->buffer);
     if (hb_result_get_cell(result, FAMILIES[0], 1, qualifier->buffer,
         qualifier->length, &mycell) == 0) {
       HBASE_LOG_INFO("Cell found, value=\'%.*s\', timestamp=%lld.",
-          mycell.value_len, mycell.value, mycell.ts);
-      hb_cell_free(&mycell);
+          mycell->value_len, mycell->value, mycell->ts);
     } else {
       HBASE_LOG_ERROR("Cell not found.");
     }
@@ -215,7 +220,7 @@ wait_for_get() {
 }
 
 /**
- * Put synchronizer and callbacks
+ * Delete synchronizer and callbacks
  */
 static volatile bool delete_done = false;
 static pthread_cond_t del_cv = PTHREAD_COND_INITIALIZER;
@@ -244,6 +249,47 @@ wait_for_delete() {
   }
   pthread_mutex_unlock(&del_mutex);
   HBASE_LOG_INFO("Delete operation completed.");
+}
+
+/**
+ * Scan synchronizer and callbacks
+ */
+static volatile bool scan_done = false;
+static pthread_cond_t scan_cv = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t scan_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void scan_callback(int32_t err, hb_scanner_t scanner,
+      hb_result_t results[], size_t num_results, void *extra) {
+  if (num_results) {
+    const char *table_name;
+    size_t table_name_len;
+    hb_result_get_table(results[0], &table_name, &table_name_len);
+    HBASE_LOG_INFO("Received scan_next callback for table=\'%.*s\', row count=%d.",
+        table_name_len, table_name, num_results);
+
+    for (int i = 0; i < num_results; ++i) {
+      printRow(results[i]);
+      hb_result_destroy(results[i]);
+    }
+    hb_scanner_next(scanner, scan_callback, NULL);
+  } else {
+    hb_scanner_destroy(scanner, NULL, NULL);
+    pthread_mutex_lock(&scan_mutex);
+    scan_done = true;
+    pthread_cond_signal(&scan_cv);
+    pthread_mutex_unlock(&scan_mutex);
+  }
+}
+
+static void
+wait_for_scan() {
+  HBASE_LOG_INFO("Waiting for scan to complete.");
+  pthread_mutex_lock(&scan_mutex);
+  while (!scan_done) {
+    pthread_cond_wait(&scan_cv, &scan_mutex);
+  }
+  pthread_mutex_unlock(&scan_mutex);
+  HBASE_LOG_INFO("Scan completed.");
 }
 
 /**
@@ -350,6 +396,7 @@ main(int argc, char **argv) {
   const char *zk_ensemble     = (argc > 2) ? argv[2] : "localhost:2181";
   const char *zk_root_znode   = (argc > 3) ? argv[3] : NULL;
   const size_t table_name_len = strlen(table_name);
+
   const int num_puts = 10;
   hb_put_t put = NULL;
 
@@ -510,6 +557,17 @@ main(int argc, char **argv) {
     wait_for_puts();
   }
 
+  // now, scan the entire table
+  {
+    hb_scanner_t scanner = NULL;
+    hb_scanner_create(client, &scanner);
+    hb_scanner_set_table(scanner, table_name, table_name_len);
+    hb_scanner_set_num_max_rows(scanner, 3);  // maximum 3 rows at a time
+    hb_scanner_set_num_versions(scanner, 10); // up to 10 versions of the cell
+    hb_scanner_next(scanner, scan_callback, NULL); // dispatch the call
+    wait_for_scan();
+  }
+
   // fetch a row with row-key="row_with_two_cells"
   {
     bytebuffer rowKey = bytebuffer_strcpy("row_with_two_cells");
@@ -520,6 +578,7 @@ main(int argc, char **argv) {
     hb_get_set_table(get, table_name, table_name_len);
     hb_get_set_num_versions(get, 10); // up to ten versions of each column
 
+    get_done = false;
     hb_get_send(client, get, get_callback, rowKey);
     wait_for_get();
   }
@@ -533,6 +592,7 @@ main(int argc, char **argv) {
         column_a->buffer, column_a->length, 1391111111112L);
     hb_mutation_set_table(del, table_name, table_name_len);
 
+    delete_done = false;
     hb_mutation_send(client, del, delete_callback, rowKey);
     wait_for_delete();
   }
@@ -547,6 +607,7 @@ main(int argc, char **argv) {
     hb_get_set_table(get, table_name, table_name_len);
     hb_get_set_num_versions(get, 10); // up to ten versions of each column
 
+    get_done = false;
     hb_get_send(client, get, get_callback, rowKey);
     wait_for_get();
   }

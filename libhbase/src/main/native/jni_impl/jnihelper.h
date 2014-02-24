@@ -52,6 +52,7 @@
 #define CLASS_RESULT_PROXY      "org/apache/hadoop/hbase/jni/ResultProxy"
 #define CLASS_DELETE_PROXY      "org/apache/hadoop/hbase/jni/DeleteProxy"
 #define CLASS_MUTATION_PROXY    "org/apache/hadoop/hbase/jni/MutationProxy"
+#define CLASS_SCANNER_PROXY     "org/apache/hadoop/hbase/jni/ScannerProxy"
 #define CLASS_TABLE_PROXY       "org/apache/hadoop/hbase/jni/TableProxy"
 
 #define ASYNC_REMOTEEXCEPTION   "org/hbase/async/RemoteException"

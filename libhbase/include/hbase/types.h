@@ -33,9 +33,10 @@ extern "C" {
 /**
  * HBase ubiquitous byte type
  */
-#ifndef byte_t
-typedef uint8_t byte_t;
+#ifdef byte_t
+#undef byte_t
 #endif
+typedef uint8_t byte_t;
 
 /**
  * Base HBase Cell type.
@@ -105,6 +106,39 @@ typedef enum {
   HBASE_LOG_LEVEL_TRACE   = 6
 } HBaseLogLevel;
 
+/*******************************************************************************
+ *                            HBase Error Codes                                *
+ *******************************************************************************
+ * The HBase APIs returns or invoke the callback functions with error code     *
+ * set to 0. A non-zero value indicates an error condition.                    *
+ *                                                                             *
+ * EAGAIN   A recoverable error occurred and the operation can be immediately  *
+ *          retired.                                                           *
+ *                                                                             *
+ * ENOBUFS  The resources required to complete the operations are temporarily  *
+ *          exhausted and the application should retry the operation after a   *
+ *          brief pause, possibly throttling the rate of requests.             *
+ *                                                                             *
+ * ENOENT   The requested table or a column family was not found.              *
+ *                                                                             *
+ * EEXIST   Table or column family already exist.                              *
+ *                                                                             *
+ * ENOMEM   The process ran out of memory while trying to process the request. *
+ *                                                                             *
+ * HBASE_TABLE_DISABLED                                                        *
+ *          The table is disabled.                                             *
+ *                                                                             *
+ * HBASE_TABLE_NOT_DISABLED                                                    *
+ *          The table is not disabled.                                         *
+ *                                                                             *
+ * HBASE_UNKNOWN_SCANNER                                                       *
+ *          The scanner does not exist on region server.                       *
+ *                                                                             *
+ * HBASE_INTERNAL_ERR                                                          *
+ *          An internal error for which there is no error code defined. More   *
+ *          information will be available in the log.                          *
+ *                                                                             *
+ *******************************************************************************/
 /**
  * HBase custom error codes
  */
@@ -114,47 +148,13 @@ typedef enum {
 #define HBASE_UNKNOWN_SCANNER       (HBASE_INTERNAL_ERR-3)
 
 /*******************************************************************************
- *                            HBase Error Codes                                *
+ *                            HBase API Callbacks                              *
  *******************************************************************************
- * The HBase APIs returns or invoke the callback functions with error code
- * set to 0. A non-zero value indicates an error condition.
- *
- * EAGAIN   A recoverable error occurred and the operation can be immediately
- *          retired.
- *
- * ENOBUFS  The resources required to complete the operations are temporarily
- *          exhausted and the application should retry the operation after a
- *          brief pause, possibly throttling the rate of requests.
- *
- * ENOENT   The requested table or a column family was not found.
- *
- * EEXIST   Table or column family already exist.
- *
- * ENOMEM   The process ran out of memory while trying to complete the request.
- *
- * HBASE_TABLE_DISABLED
- *          The table is disabled.
- *
- * HBASE_TABLE_NOT_DISABLED
- *          The table is not disabled.
- *
- * HBASE_UNKNOWN_SCANNER
- *          The scanner does not exist on region server.
- *
- * 65537    Internal Java error.
- *
- * 65538    JVM creation failed.
- *
- * 65539    Invocation of a Java method or constructor failed.
- *
- * 65540    A Java class was not found.
- *
- * 65541    A method of a Java class not found.
- *
- * 65542    Attempt to push a JNI local frame failed.
- *
- *******************************************************************************
- */
+ *      The following section defines various callback functions for the async *
+ * APIs.  These callbacks may be triggered on the same thread as the caller or *
+ * on another thread. The application is expected to not block in the callback *
+ * routines.                                                                   *
+ *******************************************************************************/
 
 /**
  * HBase Admin disconnection callback typedef
@@ -199,9 +199,7 @@ typedef void (*hb_client_flush_cb) (
 /**
  * Mutation call back typedef
  *
- * This callback is triggered with result of each mutation. It may be
- * triggered on the same thread as the caller or on another thread.
- * The application is expected to not block in the callback routine.
+ * This callback is triggered with result of each mutation.
  *
  * Refer to the section on error code for the list of possible values
  * for 'err'. A value of 0 indicates success.
@@ -215,10 +213,9 @@ typedef void (*hb_mutation_cb)(
 
 /**
  * Get callback typedef.
+ * This callback is triggered with result of each get call.
  *
- * This callback is triggered with result of each get call. It may be
- * triggered on the same thread as the caller or on another thread.
- * The application is expected to not block in the callback routine.
+ * The result, if not NULL, must be freed by calling hb_result_destroy().
  *
  * Refer to the section on error code for the list of possible values
  * for 'err'. A value of 0 indicates success.
@@ -232,8 +229,10 @@ typedef void (*hb_get_cb)(
 
 /**
  * Scanner call back typedef.
- *
  * This will be called when scanner next returns results.
+ *
+ * The individual results in the results array must be freed by calling
+ * hb_result_destroy(). The array itself is freed once the callback returns.
  *
  * Refer to the section on error code for the list of possible values
  * for 'err'. A value of 0 indicates success.

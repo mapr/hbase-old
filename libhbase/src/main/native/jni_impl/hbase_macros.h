@@ -64,6 +64,10 @@
     if (UNLIKELY(!__status__.ok())) return __status__; \
   } while (false)
 
+/**
+ * Retrieves a JNIEnv* unless one was provided.
+ * Pushes a JNI local frame on the stack.
+ */
 #define JNI_GET_ENV(current_env) \
   JNIEnv *env = current_env; \
   if (env == NULL) { \

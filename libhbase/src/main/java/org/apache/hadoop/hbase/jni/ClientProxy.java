@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import org.apache.hadoop.conf.Configuration;
 import org.hbase.async.HBaseClient;
 import org.hbase.async.KeyValue;
+import org.hbase.async.Scanner;
 
 public class ClientProxy implements Closeable {
   private final HBaseClient client_;
@@ -33,6 +34,10 @@ public class ClientProxy implements Closeable {
     final String zkQuorum = conf.get("hbase.zookeeper.ensemble");
     final String baseZNode = conf.get("zookeeper.znode.parent");
     this.client_ = new HBaseClient(zkQuorum, baseZNode);
+  }
+
+  Scanner newScanner(byte[] table) {
+    return client_.newScanner(table);
   }
 
   public void sendMutation(final MutationProxy mutationProxy,
