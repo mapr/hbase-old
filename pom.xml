@@ -1052,7 +1052,7 @@
     <jersey.version>1.8</jersey.version>
     <jruby.version>1.6.5</jruby.version>
     <junit.version>4.11</junit.version>
-    <slf4j.version>1.4.3</slf4j.version>
+    <slf4j.version>1.7.5</slf4j.version>
     <log4j.version>1.2.16</log4j.version>
     <mockito-all.version>1.8.5</mockito-all.version>
     <protobuf.version>2.5.0</protobuf.version>
@@ -1620,7 +1620,7 @@
       </activation>
       <properties>
         <hadoop.version>1.0.4</hadoop.version>
-        <slf4j.version>1.4.3</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
@@ -1863,7 +1863,7 @@
       </activation>
       <properties>
         <hadoop.version>1.1.2</hadoop.version>
-        <slf4j.version>1.4.3</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
@@ -1944,7 +1944,7 @@
       </activation>
       <properties>
         <hadoop.version>1.2.1</hadoop.version>
-        <slf4j.version>1.4.3</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
@@ -2025,7 +2025,7 @@
       </activation>
       <properties>
         <hadoop.version>0.22.0</hadoop.version>
-        <slf4j.version>1.6.1</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
@@ -2204,7 +2204,7 @@
       </activation>
       <properties>
         <hadoop.version>0.23.7</hadoop.version>
-        <slf4j.version>1.6.1</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
@@ -2286,7 +2286,7 @@
       </activation>
       <properties>
         <hadoop.version>0.24.0-SNAPSHOT</hadoop.version>
-        <slf4j.version>1.6.1</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
@@ -2368,7 +2368,7 @@
       </activation>
       <properties>
         <hadoop.version>2.0.0-alpha</hadoop.version>
-        <slf4j.version>1.6.1</slf4j.version>
+        <slf4j.version>1.7.5</slf4j.version>
       </properties>
       <dependencies>
         <dependency>
