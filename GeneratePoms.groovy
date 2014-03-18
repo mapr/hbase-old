@@ -80,7 +80,7 @@ Example param 5:
         xmlOut.setPreserveWhitespace(true)
         xmlOut.setExpandEmptyElements(false)
         xmlOut.print(pomTree)
-        File outputPomFile = new File("pom-generated-" + suffix)
+        File outputPomFile = new File("pom-generated-" + suffix + ".xml")
         outputPomFile.write(writer.toString())
     }
 
