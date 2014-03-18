@@ -62,10 +62,10 @@ Example param 5:
         }
 
         if (hadoopVersion.equalsIgnoreCase("hadoop1")) {
-            Node hadoopOneTree = makeHadoopOnePom(pomTree, privateHbaseVersion, fullMaprVersion, shortMaprVersion)
+            Node hadoopOneTree = makeHadoopOnePom(pomTree, privateHbaseVersion, fullMaprVersion, shortMaprVersion, snapshotSuffix)
             writePom(hadoopOneTree, shortMaprVersion)
         } else if (hadoopVersion.equalsIgnoreCase("hadoop2")) {
-            Node hadoopTwoTree = makeHadoopTwoPom(pomTree, privateHbaseVersion, fullMaprVersion, shortMaprVersion)
+            Node hadoopTwoTree = makeHadoopTwoPom(pomTree, privateHbaseVersion, fullMaprVersion, shortMaprVersion, snapshotSuffix)
             writePom(hadoopTwoTree, "hadoop2-" + shortMaprVersion)
         } else {
             System.err.println "invalid hadoop version: " + hadoopVersion
@@ -84,18 +84,18 @@ Example param 5:
         outputPomFile.write(writer.toString())
     }
 
-    private static Node makeHadoopOnePom(Node pomTree, String privateHbaseVersion, String fullMaprVersion, String shortMaprVersion) {
+    private static Node makeHadoopOnePom(Node pomTree, String privateHbaseVersion, String fullMaprVersion, String shortMaprVersion, String snapshotSuffix) {
         Node newPomTree = pomTree.clone()
-        newPomTree.version[0].setValue(privateHbaseVersion + "-m7-" + shortMaprVersion)
+        newPomTree.version[0].setValue(privateHbaseVersion + "-m7-" + shortMaprVersion + snapshotSuffix)
         newPomTree.properties[0]."mapr.hadoop.version"[0].setValue(fullMaprVersion)
 
         newPomTree.dependencies[0].append(makeMaprHbaseDependency())
         return newPomTree
     }
 
-    private static Node makeHadoopTwoPom(Node pomTree, String privateHbaseVersion, String fullMaprVersion, String shortMaprVersion) {
+    private static Node makeHadoopTwoPom(Node pomTree, String privateHbaseVersion, String fullMaprVersion, String shortMaprVersion, String snapshotSuffix) {
         Node newPomTree = pomTree.clone()
-        newPomTree.version[0].setValue(privateHbaseVersion + "-hadoop2-m7-" + shortMaprVersion)
+        newPomTree.version[0].setValue(privateHbaseVersion + "-hadoop2-m7-" + shortMaprVersion + snapshotSuffix)
         newPomTree.properties[0]."mapr.hadoop.version"[0].setValue(fullMaprVersion)
 
         newPomTree.dependencies[0].append(makeMaprHbaseDependency())
