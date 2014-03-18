@@ -86,7 +86,7 @@ Example param 5:
 
     private static Node makeHadoopOnePom(Node pomTree, String privateHbaseVersion, String fullMaprVersion, String shortMaprVersion) {
         Node newPomTree = pomTree.clone()
-        newPomTree.version[0].setValue(privateHbaseVersion + "-m7-" + shortMapr)
+        newPomTree.version[0].setValue(privateHbaseVersion + "-m7-" + shortMaprVersion)
         newPomTree.properties[0]."mapr.hadoop.version"[0].setValue(fullMaprVersion)
 
         newPomTree.dependencies[0].append(makeMaprHbaseDependency())
