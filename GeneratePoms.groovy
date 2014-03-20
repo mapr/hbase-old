@@ -62,7 +62,7 @@ Example param 5:
         }
         if (m7String.equalsIgnoreCase("m7")) {
             Node withM7Tree = makeM7Pom(pomTree, privateHbaseVersion, fullMaprVersion, shortMaprVersion, snapshotSuffix)
-			writePom(withM7Tree, "m7-" + shortMaprVersion)
+			writePom(withM7Tree, shortMaprVersion)
         } else {
             Node nonM7Tree = makeNonM7Pom(pomTree, privateHbaseVersion, fullMaprVersion, shortMaprVersion, snapshotSuffix)
 			writePom(nonM7Tree, shortMaprVersion)
