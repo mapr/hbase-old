@@ -975,7 +975,7 @@
     <!-- This should be set to the Apache Github tag this release is based upon -->
     <apache.git.tag>0.94.17</apache.git.tag>
     <!-- Latest version of Hadoop distributed with MapR -->
-    <mapr.hadoop.version>1.0.3-mapr-3.1.0</mapr.hadoop.version>
+    <mapr.hadoop.version>2.3.0-mapr-4.0.0-beta</mapr.hadoop.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 
